@@ -1,6 +1,8 @@
 #### Marcus .gitignore ####
 ./datasets/
 **/out/
+*/datasets/
+**/datasets/
 
 #### GitHub Python Template: ####
 
