@@ -1,1 +1,1 @@
-# pathways
+# pathway model
