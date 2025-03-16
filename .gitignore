@@ -1,6 +1,6 @@
 #### Marcus .gitignore ####
 ./datasets/
-./outputs/
+**/out/
 
 #### GitHub Python Template: ####
 
