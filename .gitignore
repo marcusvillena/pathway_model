@@ -1,6 +1,8 @@
 #### Marcus .gitignore ####
-./datasets/
 **/out/
+**/output/
+
+./datasets/
 */datasets/
 **/datasets/
 

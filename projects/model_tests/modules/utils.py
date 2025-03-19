@@ -3,7 +3,7 @@ import subprocess
 
 def quickstart_tip():
     print(
-'''**** quickstart_tip() ****
+'''*** quickstart_tip() ***
 device, generator = u.Devices().auto_set_device()
 brca = d.Data(
     counts_filepath='./data/dataFilt.csv', 
@@ -113,7 +113,7 @@ class Devices():
         return gpu_list 
     
     def set_device(self, device):
-        vprint('**** Device() ****', verbose=self.verbose)
+        vprint('*** Device() ***', verbose=self.verbose)
 
         # set device, generator
         torch.set_default_device(device)
