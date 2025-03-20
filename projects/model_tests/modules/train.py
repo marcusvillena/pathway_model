@@ -1,4 +1,5 @@
 import torch
+import torch.nn as nn
 from torch.utils.data import DataLoader, Dataset, random_split
 
 from sklearn.metrics import accuracy_score
@@ -261,3 +262,33 @@ class ClassifierTrainingModule(TrainingModule):
         metrics['accuracy'] = accuracy_score(batch['y'], batch['y_pred'])
 
         return metrics
+        
+class Experiment():
+    def __init__(
+            self, data, generator, model_class:nn.Module, training_class:TrainingModule, # required
+            batch_size:int=64, val_size:int=0.15, test_size:int=0.15, # for data_module
+            model_kwargs:dict={}, training_kwargs:dict={}, num_trials:int=10, comment:str=None # for training_module
+        ):
+        
+        # define data module
+        self.data_module = DataModule(
+            X=data.X,
+            y=data.y,
+            generator=generator,
+            batch_size=batch_size,
+            val_size=val_size,
+            test_size=test_size
+        )
+
+        # run experiment
+        self.training_module = MultiTrainingModule(
+                model_class=model_class,
+                model_kwargs=model_kwargs,
+                training_class=training_class,
+                training_kwargs={
+                    'data_module': self.data_module,
+                    **training_kwargs
+                },
+                num_trials=num_trials,
+                comment=comment
+        )

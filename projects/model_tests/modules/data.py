@@ -86,6 +86,9 @@ class Data():
 
         # get dims
         num_samples, num_nodes, num_features, num_labels, num_masks = self._get_dims(X, y, masks)
+
+        # get class_weights
+        self.class_weights = y.shape[0]/y.sum(dim=0)
             
         # assign
         self.gene_counts = gene_counts
