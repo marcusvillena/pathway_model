@@ -300,9 +300,9 @@ class Data():
                 shape = variable.shape
             elif type(variable) == torch.Tensor or type(variable) == np.ndarray:
                 shape = tuple([i for i in variable.shape])
-            elif type(variable) == list:
+            elif (type(variable) == list) or (type(variable) == dict):
                 shape = len(variable)
-            elif type(variable) == int:
+            elif (type(variable) == int) or (type(variable) == str):
                 shape = variable
             else:
                 shape = None

@@ -86,30 +86,40 @@ class MLP(nn.Module):
         return self.model(X)
 
 class MLPClassifier(nn.Module):
-    def __init__(self, in_features:int, out_features:int, mlp_kwargs={}):
+    def __init__(self, in_features:int, out_features:int, mlp_kwargs:dict={}, flatten:bool=False):
         super().__init__()
 
-        # define layers
-        self.mlp = MLP(in_features, out_features, **mlp_kwargs)
+        # assign instance variables
+        self.flatten = flatten
 
-    def forward(self, X):
+        # define layers
+        self.mlp = MLP(
+            in_features=in_features,
+            out_features=out_features,
+            **mlp_kwargs
+        )
+
+    def forward(self, X:torch.Tensor):
+        # flatten if applicable
+        if self.flatten == True:
+            X = X.squeeze(-1)
+
+        # forward pass
         logits = self.mlp(X)
+
         return logits
 
-    def predict(self, X, as_logits=True):
+    def predict(self, X:torch.Tensor, as_logits:bool=True):
         # transform if raw data (not logits)
         if as_logits == False:
             X = self.forward(X)
 
         # convert logits to prediction
         probs = torch.softmax(X, dim=1) # softmax to probs
-        y_pred = torch.argmax(probs, dim=1)
+        y_pred = torch.argmax(probs, dim=1) # argmax to most likely class
+        y_pred = F.one_hot(y_pred, probs.shape[1]) # get one-hot encoding
 
-        # return ohe
-        y_pred_ohe = F.one_hot(y_pred, probs.shape[1])
-
-        return y_pred_ohe
-
+        return y_pred
 ### GCN
 
 class GraphConvLayer(nn.Module):

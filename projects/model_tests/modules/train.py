@@ -9,6 +9,8 @@ from datetime import datetime
 from pathlib import Path
 import pandas as pd
 
+import seaborn as sns
+import matplotlib.pyplot as plt
 
 class DataModule():
     def __init__(self, X, y, generator, batch_size:int=16, val_size:int=0.15, test_size:int=0.15):
@@ -292,3 +294,85 @@ class Experiment():
                 num_trials=num_trials,
                 comment=comment
         )
+
+        # assign instance vars
+        self.comment = comment
+
+    def results(self, metric:str, plot:bool=True, title:bool=True):
+        # copy data
+        train = self.training_module.train_results.copy()
+        val = self.training_module.val_results.copy()
+        test = self.training_module.test_results.copy()
+
+        # add stage, get combined df
+        train['stage'] = 'Training'
+        val['stage'] = 'Validation'
+        dev = pd.concat([train, val])
+
+        # get test metrics
+        test_mean = test[metric].mean()
+        test_std = test[metric].std()
+
+        # return metrics if no plot
+        if plot != True:
+            return test_mean, test_std
+        
+        # return metrics with plot
+        else:
+            # define plot
+            fig, ax = plt.subplots(figsize=(16, 9))
+
+            # plot dev set results
+            sns.lineplot(data=dev, x='epoch', y=metric, hue='stage', errorbar='sd')
+
+            # plot test set line
+            ax.hlines(
+                y=test_mean, 
+                xmin=min(dev['epoch']),
+                xmax=max(dev['epoch']),
+                colors='green', 
+                linestyles='--', 
+                label='Testing (trial mean ± SD)'
+            )
+
+            # plot test set area
+            ax.fill_between(
+                x=dev['epoch'].unique(),
+                y1=test_mean - test_std,
+                y2=test_mean + test_std,
+                color='green',
+                alpha=0.2,
+            )
+
+            # add test results label
+            ax.text(
+                x=max(dev['epoch']), # x pos = final (max) epoch
+                y=test_mean + 2*test_std, # y pos = 2 std above mean
+                s=f'{test_mean:.4f} ± {test_std:.4f}', # label
+                va='bottom', # vert align
+                ha='right', # horz align
+                color='green',
+                bbox=dict(boxstyle='round,pad=0.2', facecolor='white', edgecolor='green', alpha=0.7)
+            )
+
+            # lazy title
+            if title == True:
+                plt.title(f'{self.comment}: {metric.capitalize()}')
+            
+            # axis labels
+            ax.set_xlabel("Epoch")
+            ax.set_ylabel(metric.capitalize())
+            ax.legend(title='Stage')
+            ax.grid(True)
+            fig.tight_layout()
+
+            # return test results
+            return test_mean, test_std, fig
+
+
+
+
+
+
+        
+
