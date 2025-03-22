@@ -2,15 +2,17 @@ import torch
 import torch.nn as nn
 from torch.utils.data import DataLoader, Dataset, random_split
 
-from sklearn.metrics import accuracy_score
-
-from tqdm import tqdm
-from datetime import datetime
-from pathlib import Path
 import pandas as pd
-
+import sklearn.metrics
 import seaborn as sns
 import matplotlib.pyplot as plt
+
+from datetime import datetime
+from pathlib import Path
+from tqdm import tqdm
+from typing import Literal, Callable
+
+from .utils import vprint
 
 class DataModule():
     def __init__(self, X, y, generator, batch_size:int=16, val_size:int=0.15, test_size:int=0.15):
@@ -54,7 +56,7 @@ class MultiTrainingModule():
         self.test_metrics = {}
 
         # trial loop
-        for trial in range(num_trials):
+        for trial in tqdm(range(num_trials)):
 
             # define model
             model = model_class(**model_kwargs)
@@ -122,7 +124,7 @@ class MultiTrainingModule():
         return results
 
 class TrainingModule():
-    def __init__(self, model, data_module, loss_fn, optimizer, num_epochs:int, report_metrics=['tot_loss'], optimizer_kwargs={}):
+    def __init__(self, model, data_module, loss_fn, optimizer, num_epochs:int, report_metrics=['tot_loss'], optimizer_kwargs={}, verbose:bool=True):
         # assign variables
         self.model = model
         self.data_module = data_module
@@ -131,7 +133,12 @@ class TrainingModule():
 
         # train val loop
         self.trial_metrics = {}
-        pbar = tqdm(range(num_epochs))
+        
+        # verbose, use tqdm
+        if verbose == True:
+            pbar = tqdm(range(num_epochs))
+        else:
+            pbar = range(num_epochs)
  
         for epoch in pbar:
             # training
@@ -148,15 +155,17 @@ class TrainingModule():
             val_report = self._generate_report(val_metrics, report_metrics)
 
             # update pbar with report
-            epoch_report = f'Epoch {epoch:<8}' + f'Train: {train_report}' + 8*' ' + f'Val: {val_report}'
-            pbar.set_postfix_str(epoch_report)
+            if verbose == True:
+                epoch_report = f'Epoch {epoch:<8}' + f'Train: {train_report}' + 8*' ' + f'Val: {val_report}'
+                pbar.set_postfix_str(epoch_report)
 
         # test
         self.test_metrics = self._eval_model(self.data_module.test_loader)
 
         # print test report
-        test_report = self._generate_report(self.test_metrics, report_metrics)
-        tqdm.write(f'Test\t {test_report}\n')
+        if verbose == True:
+            test_report = self._generate_report(self.test_metrics, report_metrics)
+            tqdm.write(f'Test\t {test_report}\n')
 
     def _compute_loss(self, X, y): # change in child obj if needed
         # get model output
@@ -255,14 +264,25 @@ class TrainingModule():
         return batch
 
 class ClassifierTrainingModule(TrainingModule):
-    def _compute_metrics(self, batch): # change in child obj if needed
+    def _compute_metrics(self, batch):
         # init
         metrics = {}
 
         # compute metrics
         metrics['tot_loss'] = batch['tot_loss']/batch['len']
-        metrics['accuracy'] = accuracy_score(batch['y'], batch['y_pred'])
+        metrics['accuracy'] = sklearn.metrics.accuracy_score(batch['y'], batch['y_pred'])
 
+        f1_kwargs = {
+            'y_true': batch['y'],
+            'y_pred': batch['y_pred'],
+            'average': 'weighted',
+            'zero_division': 0
+        }
+
+        metrics['precision'] = sklearn.metrics.precision_score(**f1_kwargs)
+        metrics['recall'] = sklearn.metrics.recall_score(**f1_kwargs)
+        metrics['f1'] = sklearn.metrics.f1_score(**f1_kwargs)
+        
         return metrics
         
 class Experiment():
@@ -295,81 +315,97 @@ class Experiment():
                 comment=comment
         )
 
-        # assign instance vars
+        # get summary, assign instance vars
+        self.summary = self._get_summary()
         self.comment = comment
 
-    def results(self, metric:str, plot:bool=True, title:bool=True):
+    def _get_summary(self):
+        # copy data
+        test = self.training_module.test_results.copy()
+
+        # get list of metrics
+        metrics = test.drop(columns='trial').columns.to_list()
+
+        # summarize (mean, sd) per metric
+        summary = {}
+        for metric in metrics:
+            summary[metric] = {'mean':test[metric].mean(), 'std':test[metric].std()}
+
+        # convert to df, export as csv
+        summary = pd.DataFrame(summary)
+        summary.to_csv(self.training_module.folder / 'summary.csv')
+
+        return summary
+
+    def plot(self, metric:str, title:bool=True, save_fig:bool=True, return_fig:bool=False):
         # copy data
         train = self.training_module.train_results.copy()
         val = self.training_module.val_results.copy()
-        test = self.training_module.test_results.copy()
+        test = self.summary[metric]
 
         # add stage, get combined df
         train['stage'] = 'Training'
         val['stage'] = 'Validation'
         dev = pd.concat([train, val])
 
-        # get test metrics
-        test_mean = test[metric].mean()
-        test_std = test[metric].std()
+        # define plot
+        fig, ax = plt.subplots(figsize=(16, 9))
 
-        # return metrics if no plot
-        if plot != True:
-            return test_mean, test_std
+        # plot dev set results
+        sns.lineplot(data=dev, x='epoch', y=metric, hue='stage', errorbar='sd')
+
+        # plot test set line
+        ax.hlines(
+            y=test['mean'], 
+            xmin=min(dev['epoch']),
+            xmax=max(dev['epoch']),
+            colors='green', 
+            linestyles='--', 
+            label='Testing (trial mean ± SD)'
+        )
+
+        # plot test set area
+        ax.fill_between(
+            x=dev['epoch'].unique(),
+            y1=test['mean'] - test['std'],
+            y2=test['mean'] + test['std'],
+            color='green',
+            alpha=0.2,
+        )
+
+        # add test results label
+        ax.text(
+            x=max(dev['epoch']), # x pos = final (max) epoch
+            y=test['mean'] + 2*test['std'], # y pos = 2 std above mean
+            s=f'{test['mean']:.4f} ± {test['std']:.4f}', # label
+            va='bottom', # vert align
+            ha='right', # horz align
+            color='green',
+            bbox=dict(boxstyle='round,pad=0.2', facecolor='white', edgecolor='green', alpha=0.7)
+        )
+
+        # lazy title
+        if title == True:
+            plt.title(f'{self.comment}: {metric.capitalize()}')
         
-        # return metrics with plot
-        else:
-            # define plot
-            fig, ax = plt.subplots(figsize=(16, 9))
+        # axis labels
+        ax.set_xlabel("Epoch")
+        ax.set_ylabel(metric.capitalize())
+        ax.legend(title='Stage')
+        ax.grid(True)
+        fig.tight_layout()
 
-            # plot dev set results
-            sns.lineplot(data=dev, x='epoch', y=metric, hue='stage', errorbar='sd')
+        # save plot
+        if save_fig == True:
+            fig.savefig(self.training_module.folder / f'{self.comment}_{metric}.svg')
 
-            # plot test set line
-            ax.hlines(
-                y=test_mean, 
-                xmin=min(dev['epoch']),
-                xmax=max(dev['epoch']),
-                colors='green', 
-                linestyles='--', 
-                label='Testing (trial mean ± SD)'
-            )
+        # return fig
+        if return_fig == True:
+            return fig
 
-            # plot test set area
-            ax.fill_between(
-                x=dev['epoch'].unique(),
-                y1=test_mean - test_std,
-                y2=test_mean + test_std,
-                color='green',
-                alpha=0.2,
-            )
+        
 
-            # add test results label
-            ax.text(
-                x=max(dev['epoch']), # x pos = final (max) epoch
-                y=test_mean + 2*test_std, # y pos = 2 std above mean
-                s=f'{test_mean:.4f} ± {test_std:.4f}', # label
-                va='bottom', # vert align
-                ha='right', # horz align
-                color='green',
-                bbox=dict(boxstyle='round,pad=0.2', facecolor='white', edgecolor='green', alpha=0.7)
-            )
-
-            # lazy title
-            if title == True:
-                plt.title(f'{self.comment}: {metric.capitalize()}')
-            
-            # axis labels
-            ax.set_xlabel("Epoch")
-            ax.set_ylabel(metric.capitalize())
-            ax.legend(title='Stage')
-            ax.grid(True)
-            fig.tight_layout()
-
-            # return test results
-            return test_mean, test_std, fig
-
-
+        
 
 
 

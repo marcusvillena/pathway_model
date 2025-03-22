@@ -1,5 +1,8 @@
 import torch
 import subprocess
+import pandas as pd
+
+from pandas import DataFrame
 
 def quickstart_tip():
     print(
@@ -16,9 +19,11 @@ brca = d.Data(
 '''
     )
 
+
 def vprint(*objects, verbose=True, **kwargs):
     if verbose==True:
         print(*objects, **kwargs)
+
 
 def preview_tensor(tensor:torch.tensor, tensor_name:str = '', print_tensor = True):
     # set default tensor name, if not provided
@@ -33,6 +38,7 @@ def preview_tensor(tensor:torch.tensor, tensor_name:str = '', print_tensor = Tru
         print(tensor, '\n')
     return tensor
 
+
 def preview_model(model:torch.nn.Module, tensor:torch.tensor, model_name:str='model', print_tensor=False):
     # print model
     print(model, '\n')
@@ -40,6 +46,28 @@ def preview_model(model:torch.nn.Module, tensor:torch.tensor, model_name:str='mo
     # print X, model(X)
     preview_tensor(tensor, 'X', print_tensor=print_tensor)
     preview_tensor(model(tensor), f'{model_name}(X)', print_tensor=print_tensor)
+
+
+def check_self_loops(df:DataFrame, source:str='idx1', target:str='idx2'):
+    '''checks relation for self loop edges'''
+    # get self-loops df
+    self_loops = df[df[source] == df[target]]
+
+    # print True if df has self loops, reutrn
+    print(not self_loops.empty)
+    return self_loops
+
+def check_bidirectional(df:DataFrame, source:str='idx1', target:str='idx2'):
+    '''checks relation for bidirectional edges'''
+    # get reverse; merge with original (finds bidirectional)
+    df_reversed = df.rename(columns={source: target, target: source})
+    bidirectional = pd.merge(df, df_reversed, on=[source, target])
+    bidirectional = bidirectional[bidirectional[source] != bidirectional[target]] # remove self-loops
+
+    # print True if df has bidirectional edges loops, reutrn
+    print(not bidirectional.empty)
+    return bidirectional
+
 
 class Devices():
     def __init__(self, verbose:bool=True):
