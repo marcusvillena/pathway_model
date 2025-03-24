@@ -88,7 +88,7 @@ def _get_layers(in_features:int, out_features:int, layer_class, layer_kwargs:dic
 #### MLP ####
 
 class MLP(nn.Module):
-    def __init__(self, in_features:int, out_features:int, hidden_dims:list=[], bias=False, act_fn=nn.LeakyReLU(), end_fn=None):
+    def __init__(self, in_features:int, out_features:int, hidden_dims:list=[], bias:bool=False, act_fn=nn.LeakyReLU(), end_fn=None):
         super().__init__()
 
         # define layers

@@ -398,15 +398,15 @@ class ClassifierTrainingModule(TrainingModule):
         return metrics
 
 class Experiment():
-    def __init__(self, data, generator, num_epochs:int, num_trials:int, batch_size:int=16, val_size:int=0.15, test_size:int=0.15):
+    def __init__(self, X, y, generator, num_epochs:int, num_trials:int, batch_size:int=16, val_size:int=0.15, test_size:int=0.15):
         # inst vars
         self.num_epochs = num_epochs
         self.num_trials = num_trials
 
         # init data module
         self.data_module = DataModule(
-            X=data.X,
-            y=data.y,
+            X=X,
+            y=y,
             generator=generator,
             batch_size=batch_size,
             val_size=val_size,
