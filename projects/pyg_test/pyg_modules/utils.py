@@ -1,7 +1,7 @@
 import torch
 import subprocess
-import pandas as pd
 import numpy as np
+import pandas as pd
 
 from pandas import DataFrame
 
@@ -24,29 +24,6 @@ brca = d.Data(
 def vprint(*objects, verbose=True, **kwargs):
     if verbose==True:
         print(*objects, **kwargs)
-
-
-def preview_tensor(tensor:torch.tensor, tensor_name:str = '', print_tensor = True):
-    # set default tensor name, if not provided
-    if tensor_name == '':
-        tensor_name = 'tensor shape'
-
-    # print tensor shape
-    print(f'{tensor_name}: {tensor.shape}')
-
-    # print/return tensor
-    if print_tensor == True:
-        print(tensor, '\n')
-    return tensor
-
-
-def preview_model(model:torch.nn.Module, tensor:torch.tensor, model_name:str='model', print_tensor=False):
-    # print model
-    print(model, '\n')
-    
-    # print X, model(X)
-    preview_tensor(tensor, 'X', print_tensor=print_tensor)
-    preview_tensor(model(tensor), f'{model_name}(X)', print_tensor=print_tensor)
 
 def dict_summary(_dict:dict, width:int=24):
     # init str
@@ -77,6 +54,29 @@ def dict_summary(_dict:dict, width:int=24):
             out += f'# {key:<{width}} {type(value).__name__}\n'
 
     return out
+
+def preview_tensor(tensor:torch.tensor, tensor_name:str = '', print_tensor = True):
+    # set default tensor name, if not provided
+    if tensor_name == '':
+        tensor_name = 'tensor shape'
+
+    # print tensor shape
+    print(f'{tensor_name}: {tensor.shape}')
+
+    # print/return tensor
+    if print_tensor == True:
+        print(tensor, '\n')
+    return tensor
+
+
+def preview_model(model:torch.nn.Module, tensor:torch.tensor, model_name:str='model', print_tensor=False):
+    # print model
+    print(model, '\n')
+    
+    # print X, model(X)
+    preview_tensor(tensor, 'X', print_tensor=print_tensor)
+    preview_tensor(model(tensor), f'{model_name}(X)', print_tensor=print_tensor)
+
 
 def check_self_loops(df:DataFrame, source:str='idx1', target:str='idx2'):
     '''checks relation for self loop edges'''
