@@ -10,6 +10,7 @@ from pathlib import Path
 from sklearn.preprocessing import RobustScaler, StandardScaler
 from torch_geometric.data import InMemoryDataset, Data
 from torch_geometric.loader import DataLoader
+from torch_geometric.transforms import AddLaplacianEigenvectorPE
 
 #### typing ####
 from torch import Tensor
@@ -341,7 +342,7 @@ class Preprocessor():
         # get edge attr
         attr_cols = relation.columns.drop([source, target])
         if len(attr_cols) > 0:
-            edge_attr = torch.tensor(relation[attr_cols].values, dtype=torch.int64)
+            edge_attr = torch.tensor(relation[attr_cols].values, dtype=torch.float32)
         else:
             edge_attr = None
 
@@ -367,12 +368,14 @@ class Preprocessor():
         return dict_summary(self.__dict__)
     
 class GraphDataset(InMemoryDataset):
-    def __init__(self, preprocessor:Preprocessor, verbose:bool=True, *args, **kwargs):
+    def __init__(self, preprocessor:Preprocessor, laplacian_eigs:int=16, verbose:bool=True, *args, **kwargs):
         super().__init__(*args, **kwargs)
         self.x = preprocessor.x
         self.y = preprocessor.y
         self.edge_index = preprocessor.edge_index
-        self.edge_attr = preprocessor.edge_attr        
+        self.edge_attr = preprocessor.edge_attr
+        self.laplacian_eigs = laplacian_eigs
+        self.device = self.x.device    
 
         # process data
         self.data, self.slices = self._process_data()
@@ -381,9 +384,41 @@ class GraphDataset(InMemoryDataset):
         if verbose == True:
             self.print_dims()
 
+    def _add_laplacian_PE(self):
+        torch.set_default_device('cpu')
+
+        # Step 1: Move edge_index safely to CPU
+        temp_x = self.x.cpu()
+        temp_edge_index = self.edge_index.cpu()
+
+        # Step 2: Build a safe temporary graph
+        num_nodes = temp_edge_index.max().item() + 1
+        temp_graph = Data(
+            x=temp_x[0],
+            edge_index=temp_edge_index,
+            num_nodes=num_nodes
+        )
+
+        # Step 3: Apply Laplacian PE
+        laplacian = AddLaplacianEigenvectorPE(k=self.laplacian_eigs)
+        temp_graph = laplacian(temp_graph)
+
+        # Step 4: Move laplacian_pe to correct device
+        temp_graph.laplacian_eigenvector_pe = temp_graph.laplacian_eigenvector_pe.to(self.device)
+
+        # Step 5: Return laplacian_pe
+        laplacian_pe = temp_graph.laplacian_eigenvector_pe
+        
+        torch.set_default_device(self.device)
+
+        return laplacian_pe
+
     def _process_data(self): 
         data_list = []
         num_samples = self.x.size(0)
+
+        # generate laplacian PE
+        laplacian_pe = self._add_laplacian_PE()
 
         # for each sample
         for i in range(num_samples):
@@ -398,6 +433,9 @@ class GraphDataset(InMemoryDataset):
 
             # add sample id
             data_entry.sample_id = i
+
+            # add laplacian pe
+            data_entry.laplacian_pe = laplacian_pe
 
             # append to list
             data_list.append(data_entry)

@@ -3,6 +3,10 @@ import subprocess
 import numpy as np
 import pandas as pd
 
+from torch import Tensor
+from torch_geometric.data import Batch
+from typing import Literal, Optional, Union
+
 def vprint(*objects, verbose=True, **kwargs):
     if verbose==True:
         print(*objects, **kwargs)
@@ -36,6 +40,61 @@ def dict_summary(_dict:dict, width:int=24):
             out += f'# {key:<{width}} {type(value).__name__}\n'
 
     return out
+
+def reshape_x(x:Union[Tensor, Batch], to:Literal['b,n,f','b*n,f','b,n*f'], batch_size:Optional[int]=None, num_nodes:Optional[int]=None, num_node_features:Optional[int]=None, return_dims:bool=False):
+    '''
+    detects x of size (b,n,f), (b*n,f), or (b,n*f) and returns desired view
+    '''
+    # if batch
+    if hasattr(x, 'x'):
+        batch_size = x.batch_size
+        num_node_features = x.num_node_features
+        x = x.x
+        
+    # ensure supported dim
+    assert x.dim() in (2,3), f'unsupported x.dim(): {x.dim()}'
+
+    # b,n,f all known
+    if (batch_size is not None) and (num_nodes is not None) and (num_node_features is not None):
+        pass # do nothing
+    elif x.dim() == 3:
+        batch_size, num_nodes, num_node_features = x.shape
+
+    # one unknown (dim = 2)
+    else:
+        # find num_nodes
+        if (batch_size is not None) and (num_node_features is not None):
+            if x.shape[-1] == num_node_features: # b*n,f case
+                num_nodes = int(x.shape[0]//batch_size)
+            else: # b,n*f case
+                num_nodes = int(x.shape[-1]//num_node_features)
+
+        # find batch_size
+        elif (num_nodes is not None) and (num_node_features is not None):
+            if x.shape[-1] == num_node_features: # b*n,f case
+                batch_size = int(x.shape[0]//num_nodes)
+            else: # b,n*f case
+                batch_size = x.shape[0]
+
+        # find num_node_features
+        elif (batch_size is not None) and (num_nodes is not None):
+            if x.shape[0] == batch_size: # b,n*f case
+                num_node_features = int(x.shape[-1]//num_nodes)
+            else: # b*n,f case
+                num_nodes = x.shape[-1]
+
+        # not enough information
+        assert sum(p is not None for p in [batch_size, num_nodes, num_node_features]) >= 2, 'two of [batch_size, num_nodes, num_node_features] must be provided'
+
+    # reshape
+    if to == 'b,n,f':
+        x = x.reshape(batch_size, num_nodes, num_node_features)
+    elif to == 'b*n,f':
+        x = x.reshape(batch_size * num_nodes, num_node_features)
+    else: # 'b,n*f
+        x = x.reshape(batch_size, num_nodes * num_node_features)
+
+    return (x, batch_size, num_nodes, num_node_features) if return_dims else x
 
 class Devices():
     def __init__(self, verbose:bool=True):
