@@ -1,3 +1,5 @@
+import functools
+import inspect
 import torch
 import subprocess
 import numpy as np
@@ -41,60 +43,99 @@ def dict_summary(_dict:dict, width:int=24):
 
     return out
 
-def reshape_x(x:Union[Tensor, Batch], to:Literal['b,n,f','b*n,f','b,n*f'], batch_size:Optional[int]=None, num_nodes:Optional[int]=None, num_node_features:Optional[int]=None, return_dims:bool=False):
+def reshape(x:Union[Tensor, Batch], to:Literal['b,n,f','b*n,f','b,n*f'], batch_size:Optional[int]=None, num_nodes:Optional[int]=None, num_features:Optional[int]=None, return_dims:bool=False):
     '''
     detects x of size (b,n,f), (b*n,f), or (b,n*f) and returns desired view
     '''
     # if batch
     if hasattr(x, 'x'):
         batch_size = x.batch_size
-        num_node_features = x.num_node_features
+        num_features = x.num_node_features
         x = x.x
         
     # ensure supported dim
     assert x.dim() in (2,3), f'unsupported x.dim(): {x.dim()}'
 
     # b,n,f all known
-    if (batch_size is not None) and (num_nodes is not None) and (num_node_features is not None):
+    if (batch_size is not None) and (num_nodes is not None) and (num_features is not None):
         pass # do nothing
     elif x.dim() == 3:
-        batch_size, num_nodes, num_node_features = x.shape
+        batch_size, num_nodes, num_features = x.shape
 
     # one unknown (dim = 2)
     else:
         # find num_nodes
-        if (batch_size is not None) and (num_node_features is not None):
-            if x.shape[-1] == num_node_features: # b*n,f case
+        if (batch_size is not None) and (num_features is not None):
+            if x.shape[-1] == num_features: # b*n,f case
                 num_nodes = int(x.shape[0]//batch_size)
             else: # b,n*f case
-                num_nodes = int(x.shape[-1]//num_node_features)
+                num_nodes = int(x.shape[-1]//num_features)
 
         # find batch_size
-        elif (num_nodes is not None) and (num_node_features is not None):
-            if x.shape[-1] == num_node_features: # b*n,f case
+        elif (num_nodes is not None) and (num_features is not None):
+            if x.shape[-1] == num_features: # b*n,f case
                 batch_size = int(x.shape[0]//num_nodes)
             else: # b,n*f case
                 batch_size = x.shape[0]
 
-        # find num_node_features
+        # find num_features
         elif (batch_size is not None) and (num_nodes is not None):
             if x.shape[0] == batch_size: # b,n*f case
-                num_node_features = int(x.shape[-1]//num_nodes)
+                num_features = int(x.shape[-1]//num_nodes)
             else: # b*n,f case
                 num_nodes = x.shape[-1]
 
         # not enough information
-        assert sum(p is not None for p in [batch_size, num_nodes, num_node_features]) >= 2, 'two of [batch_size, num_nodes, num_node_features] must be provided'
+        assert sum(p is not None for p in [batch_size, num_nodes, num_features]) >= 2, 'two of [batch_size, num_nodes, num_features] must be provided'
 
     # reshape
     if to == 'b,n,f':
-        x = x.reshape(batch_size, num_nodes, num_node_features)
+        x = x.reshape(batch_size, num_nodes, num_features)
     elif to == 'b*n,f':
-        x = x.reshape(batch_size * num_nodes, num_node_features)
+        x = x.reshape(batch_size * num_nodes, num_features)
     else: # 'b,n*f
-        x = x.reshape(batch_size, num_nodes * num_node_features)
+        x = x.reshape(batch_size, num_nodes * num_features)
 
-    return (x, batch_size, num_nodes, num_node_features) if return_dims else x
+    return (x, batch_size, num_nodes, num_features) if return_dims else x
+
+def filter_kwargs(func):
+    '''
+    decorator/wrapper for safe_call. 
+
+    for functions, use as filter_kwargs(func)(*args, **kwargs)
+
+    for callable instances, use as filter_kwargs(class(*args, **kwargs))
+    this inits the class, and wraps its call/forward fxn
+    '''
+    # get list of args
+    sig = inspect.signature(func)
+
+    # check if accepts args, kwargs
+    accepts_args = any(
+        p.kind == inspect.Parameter.VAR_POSITIONAL for p in sig.parameters.values()
+    )
+    accepts_kwargs = any(
+        p.kind == inspect.Parameter.VAR_KEYWORD for p in sig.parameters.values()
+    )
+
+    @functools.wraps(func)
+    def wrapper(*args, **kwargs):
+
+        # filter args
+        if not accepts_args:
+            num_pos = sum(1 for p in sig.parameters.values()
+                          if p.kind in (inspect.Parameter.POSITIONAL_ONLY,
+                                        inspect.Parameter.POSITIONAL_OR_KEYWORD))
+            args = args[:num_pos]
+
+        # filter kwargs
+        if not accepts_kwargs:
+            valid_keys = set(sig.parameters)
+            kwargs = {k: v for k, v in kwargs.items() if k in valid_keys}
+
+        return func(*args, **kwargs)
+
+    return wrapper
 
 class Devices():
     def __init__(self, verbose:bool=True):

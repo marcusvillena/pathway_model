@@ -10,7 +10,7 @@ from torchmetrics.functional import (
 )
 
 from .data import GraphDataset
-from .utils import reshape_x
+from .utils import reshape
 
 from torch import Generator, Tensor
 from torch.utils.data import random_split
@@ -287,7 +287,7 @@ class Log2ReconTrainer(Trainer):
 class NBTrainer(Log2ReconTrainer):
     def _compute_loss(self, batch):
         # extract x
-        x = reshape_x(x=batch, to='b,n*f')
+        x = reshape(x=batch, to='b,n*f').unsqueeze(-1)
 
         # forward pass
         out = self.model(batch)

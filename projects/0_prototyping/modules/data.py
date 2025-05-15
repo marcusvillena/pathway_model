@@ -407,18 +407,18 @@ class GraphDataset(InMemoryDataset):
         temp_graph.laplacian_eigenvector_pe = temp_graph.laplacian_eigenvector_pe.to(self.device)
 
         # Step 5: Return laplacian_pe
-        laplacian_pe = temp_graph.laplacian_eigenvector_pe
+        pe = temp_graph.laplacian_eigenvector_pe
         
         torch.set_default_device(self.device)
 
-        return laplacian_pe
+        return pe
 
     def _process_data(self): 
         data_list = []
         num_samples = self.x.size(0)
 
         # generate laplacian PE
-        laplacian_pe = self._add_laplacian_PE()
+        pe = self._add_laplacian_PE()
 
         # for each sample
         for i in range(num_samples):
@@ -435,7 +435,7 @@ class GraphDataset(InMemoryDataset):
             data_entry.sample_id = i
 
             # add laplacian pe
-            data_entry.laplacian_pe = laplacian_pe
+            data_entry.pe = pe
 
             # append to list
             data_list.append(data_entry)

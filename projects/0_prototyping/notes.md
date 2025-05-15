@@ -194,9 +194,17 @@ bahdanau attention
 luong attention
 SiGAT
 
-CCA
-Barlow tiwns
-VICReg
+Similarity
+    CCA
+    Barlow tiwns
+    VICReg
+
+Pooling
+    BERT
+    Multi CLS: Perceiver, Set Transformer, DETR
+    Weighted aggregation as alternative (simple linear softmax)
+
+* tanh vs softsign vs sigmoid: Bengio et al., 2013: "On the difficulty of training RNNs"
 
 edge feature = parent node feature
 * attention visualization
@@ -207,3 +215,5 @@ edge feature = parent node feature
 
 * DESeq2: unscaled data with NB trained on NB NLL
 * limma: log2 data with linear trained on MSE (OLS)
+
+
