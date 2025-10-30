@@ -11,6 +11,14 @@ from torch import Tensor
 from torch_geometric.data import Batch, Data
 from typing import Literal, Optional, Union
 
+def tsoftmax(input:Tensor, temperature:float=1, dim:int=None, dtype:Optional[torch.dtype]=None):
+    if temperature is None:
+        temperature = 1
+    if temperature <= 0:
+        raise ValueError("Temperature must be > 0")
+    
+    return torch.softmax(input / temperature, dim=dim)
+
 # general
 def vprint(*objects, verbose=True, **kwargs):
     if verbose==True:

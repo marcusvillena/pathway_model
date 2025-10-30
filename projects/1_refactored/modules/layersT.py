@@ -1,4 +1,4 @@
-from .utils import cloneable, get_layers, filter_kwargs, input_to_dict, reshape
+from .utils import cloneable, get_layers, filter_kwargs, input_to_dict, reshape, tsoftmax
 
 import torch
 import torch.nn as nn
@@ -117,9 +117,9 @@ class SetPooling(nn.Module):
         mean = x_set / nodes_per_set
 
         return {'x':mean}
-    
+
 @cloneable
-class AttentionSetPooling(SetPooling):
+class tAttentionSetPooling(SetPooling):
     def __init__(
         self, 
         mask:Tensor, 
@@ -144,11 +144,27 @@ class AttentionSetPooling(SetPooling):
             norm_fn=norm_fn,
             end_fn=end_fn
         )
+    def forward(self, input:Union[Data, Tensor, dict], concat:bool=True, return_dict:bool=False, temperature:Optional[float]=1):
+        # get input as kwargs dict
+        data = input_to_dict(input)
 
-    def pool(self, x:Tensor):
+        # get x in (batch, nodes, features)
+        x_node = reshape(x=data['x'], to='b,n,f', num_nodes=self.num_nodes, num_features=self.num_features)
+
+        # pool x to (batch, set, features)
+        out = self.pool(x_node, temperature)
+        x_set = out.get('x')
+
+        # concat to (batch, nodes + sets, features)
+        x = torch.cat([x_node, x_set], dim=1) if concat else x_set
+        out['x'] = x
+
+        return out if return_dict else out['x']
+    
+    def pool(self, x:Tensor, temperature:Optional[float]=1):
         # compute masked scores, attention
         scores = self.lin(x).masked_fill(self.mask == 0, float('-inf'))
-        attn = torch.softmax(scores, dim=1) # dim 1 or -1?
+        attn = tsoftmax(scores, temperature, dim=1) # dim 1 or -1?
 
         # apply attention (weighted mean)
         x = torch.einsum('bnf,bns->bsf', x, attn)
