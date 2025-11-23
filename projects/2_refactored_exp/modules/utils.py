@@ -1,15 +1,17 @@
 import copy
 import functools
 import inspect
+import itertools
 import torch
 import torch.nn as nn
 import subprocess
 import numpy as np
 import pandas as pd
 
+# typing
 from torch import Tensor
 from torch_geometric.data import Batch, Data
-from typing import Literal, Optional, Union
+from typing import Callable, Literal, Optional, Type, Union
 
 def tsoftmax(input:Tensor, temperature:float=1, dim:int=None, dtype:Optional[torch.dtype]=None):
     if temperature is None:
@@ -54,7 +56,61 @@ def dict_summary(_dict:dict, width:int=24):
 
     return out
 
+# training
+def clean_name(name): # for t.grid()
+    # convert to str
+    if isinstance(name,float):
+        name = f'{name:.5e}' # sci not.
+        name = name.replace('e-0','e-')
+        name = name.replace('e+0','e')
+        mantissa, exp = name.split('e')
+        mantissa = mantissa.rstrip('0').rstrip('.')
+        name = f'{mantissa}e{exp}'
+    if isinstance(name, str):
+        name.capitalize()
+    else:
+        name = f'{name}'
+
+    # clean str
+    name = name.replace('.','p')
+    name = name.replace('_','')
+    
+    return name
+
 # models
+def build_hidden_dims(embed_dim:int, hidden_dims:Union[int, list[int], None]) -> Optional[list[int]]:
+    # none case
+    if (hidden_dims is None) or isinstance(hidden_dims, list):
+        return hidden_dims
+
+    # int case: use as depth
+    elif isinstance(hidden_dims, int):
+        return [embed_dim] * hidden_dims
+
+    # error case
+    raise TypeError(f"{hidden_dims} must be a int or list[int], got {type(hidden_dims)}")  
+
+def clone_or_init(
+   name:str,
+   obj:Union[nn.Module, Type[nn.Module]],
+   base_class:Type[nn.Module],
+   builder: Callable[[Type[nn.Module]], nn.Module]
+) -> nn.Module:
+   # if (predefined) instance
+   if isinstance(obj, base_class):
+      if callable(getattr(obj, "clone", None)): 
+         return obj.clone() # clone if applicable
+      return copy.deepcopy(obj) # else deepcopy
+
+   # elif (not defined) class
+   elif isinstance(obj, type) and issubclass(obj, base_class):
+      return builder(obj)
+
+   # else error case
+   raise TypeError(
+      f"{name} must be a {base_class.__name__} instance or subclass, got {type(obj)}"
+   )   
+
 def input_to_dict(input):
     if isinstance(input, Tensor): # x (Tensor) only
         data = {'x':input}
@@ -125,75 +181,149 @@ def filter_kwargs(func):
     '''
     decorator/wrapper for safe_call. 
 
-    for functions, use as filter_kwargs(func)(*args, **kwargs)
+    for functions:
+        filter_kwargs(func)(*args, **kwargs)
 
-    for callable instances, use as filter_kwargs(class(*args, **kwargs))
-    this inits the class, and wraps its call/forward fxn
+    for class.__init__ (constructors):
+        filter_kwargs(class)(*args, **kwargs)
+        this wraps __init__
+
+    for class.__call__ (callable instances): 
+        filter_kwargs(class(*args, **kwargs)) 
+        this wraps __call__ e.g. inits the class (no filter), and wraps its call/forward fxn
+
+    for both __init__ and __call__:
+        filter_kwargs(filter_kwargs(class)(*args,**kwargs))
     '''
+    
     # get list of args
     sig = inspect.signature(func)
 
     # check if accepts args, kwargs
     accepts_args = any(
-        p.kind == inspect.Parameter.VAR_POSITIONAL for p in sig.parameters.values()
+        p.kind == inspect.Parameter.VAR_POSITIONAL 
+        for p in sig.parameters.values()
     )
     accepts_kwargs = any(
-        p.kind == inspect.Parameter.VAR_KEYWORD for p in sig.parameters.values()
+        p.kind == inspect.Parameter.VAR_KEYWORD 
+        for p in sig.parameters.values()
     )
 
+    # get number of positional args/kwargs to keep
+    if not accepts_args:
+        num_pos = sum(
+            1 for p in sig.parameters.values()
+            if p.kind in (
+                inspect.Parameter.POSITIONAL_ONLY, 
+                inspect.Parameter.POSITIONAL_OR_KEYWORD
+            )
+        )
+    else:
+        num_pos = None
+
+    # get valid keys (ignore positional only)
+    if not accepts_kwargs:
+        valid_keys = {
+            name for name, p in sig.parameters.items()
+            if p.kind is not inspect.Parameter.POSITIONAL_ONLY
+        }
+    else:
+        valid_keys = None
+
+    # build wrapper (called on each call)
     @functools.wraps(func)
     def wrapper(*args, **kwargs):
 
-        # filter args
-        if not accepts_args:
-            num_pos = sum(1 for p in sig.parameters.values()
-                          if p.kind in (inspect.Parameter.POSITIONAL_ONLY,
-                                        inspect.Parameter.POSITIONAL_OR_KEYWORD))
+        # filter args (remove extra pos arg/kwargs), and extra args provided
+        if not accepts_args and len(args) > num_pos:
             args = args[:num_pos]
 
-        # filter kwargs
-        if not accepts_kwargs:
-            valid_keys = set(sig.parameters)
+        # filter kwargs (remove positional-only), and kwargs not empty
+        if not accepts_kwargs and kwargs:
             kwargs = {k: v for k, v in kwargs.items() if k in valid_keys}
 
         return func(*args, **kwargs)
 
     return wrapper
 
-def cloneable(model):
-    """
-    Decorator: make a model cloneable for training
-    """
-    # save original model.__init__
-    model_init = model.__init__
+def capture_kwargs(sig:inspect.Signature, *args, **kwargs):
+    # bind args/kwargs passed to func (sig)
+    bound = sig.bind(*args, **kwargs)
 
-    # saves previous typehinting, etc.
-    @functools.wraps(model_init) 
+    # fill in defaults for remaining
+    bound.apply_defaults()
 
-    # override __init__ to capture args, kwargs
+    # get original kwargs
+    orig_kwargs = {}
+    for name, value in bound.arguments.items(): # dict
+
+        # skip 'self' instance
+        if name == 'self': continue
+
+        # skip *args and **kwargs
+        param = sig.parameters[name]
+        if param.kind in (
+            inspect.Parameter.VAR_POSITIONAL, # *args
+            inspect.Parameter.VAR_KEYWORD # **kwargs
+        ): continue
+
+        # append to original_kwargs
+        orig_kwargs[name] = value
+
+    return orig_kwargs
+
+def cloneable(obj):
+    '''
+    (1) updates __init__ to capture and store original args/kwargs when initialized (_orig_kwargs)
+    (2) adds clone() method to build new instance of the same type using _orig_kwargs
+    (3) adds is_trained flag to nn.Module (models)
+    '''
+    # get original init and its signatuire (args, kwargs)
+    orig_init = obj.__init__
+    sig = inspect.signature(orig_init) 
+
+    # define new init (orig init + kwargs capture)
+    @functools.wraps(orig_init) # preserve name, doc, typehints, etc.
     def __init__(self, *args, **kwargs):
-        self.init_args = args
-        self.init_kwargs = kwargs
-        model_init(self, *args, **kwargs) # run original model init
 
-    # define cloning function
+        # capture, store orig_kwargs on instance
+        self._orig_kwargs = capture_kwargs(sig, self, *args, **kwargs)
+
+        # store training status on instance
+        if isinstance(self, nn.Module):
+            self.is_trained = False
+
+        # call original init
+        orig_init(self, *args, **kwargs)
+
+    # define clone func
     def clone(self, with_state:bool=False, **override_kwargs):
-        # initiate new model
-        init_kwargs = {**self.init_kwargs, **override_kwargs}
-        new_model = type(self)(*self.init_args, **init_kwargs)
+        # ensure _orig_kwargs is stored and exists
+        if not hasattr(self, '_orig_kwargs'):
+            raise RuntimeError(f'{type(self).__name__} was not initialized via @cloneable, _orig_kwargs is missing.')
 
-        # update state dict (e.g. cloning trained models)
-        if with_state and hasattr(self, 'state_dict'):
-            new_model.load_state_dict(self.state_dict())
+        # merge orig kwargs with override kwargs (if applicable)
+        init_kwargs = {**self._orig_kwargs, **override_kwargs}
 
-        return new_model
+        # build clone
+        new_obj = type(self)(**init_kwargs)
+
+        # load state_dict (if applicable)
+        if with_state and hasattr(self, 'state_dict') and hasattr(new_obj, 'load_state_dict'):
+            new_obj.load_state_dict(self.state_dict())
+
+            if hasattr(self, 'is_trained'): 
+                new_obj.is_trained = self.is_trained
+
+        elif hasattr(new_obj, 'is_trained'):
+            new_obj.is_trained = False
+
+        return new_obj
     
-    # update model
-    model.__init__ = __init__ # override init
-    model.clone = clone # add clone function
-    model.is_trained = False # add tracker
-
-    return model
+    # add new init and clone func to obj
+    obj.__init__ = __init__
+    obj.clone = clone
+    return obj
 
 def get_layers(
     in_channels:int, 
@@ -303,6 +433,12 @@ class Devices():
         else:
             self.gpu_info = self.gpu_list = []
 
+        # print
+        if self.verbose:
+            for gpu in self.gpu_info:
+                print(gpu)
+            print()
+
     def _get_available_devices(self):
         # init list with cpu
         available = {'cpu':''}
@@ -359,13 +495,12 @@ class Devices():
     def set_device(self, device):
         vprint('# #### Device() ####', verbose=self.verbose)
 
-        # set device, generator
+        # set device
         torch.set_default_device(device)
-        generator = torch.Generator(device=device)
 
         # print
         vprint(f'# device = {torch.get_default_device().__str__()}\n', verbose=self.verbose)
-        return device, generator
+        return device
     
     def auto_set_device(self, drop:list=[]):
         # check device to use, cuda > mps > cpu
@@ -378,6 +513,6 @@ class Devices():
             device = 'cpu'
 
         # set device
-        device, generator = self.set_device(device)
+        device = self.set_device(device)
 
-        return device, generator
+        return device

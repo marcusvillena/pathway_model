@@ -1,8 +1,9 @@
+import inspect
 import numpy as np
 import pandas as pd
 import torch
 
-from modules.utils import vprint, dict_summary
+from modules.utils import capture_kwargs, vprint, dict_summary
 from pathlib import Path
 from torch_geometric.data import InMemoryDataset, Data
 from torch_geometric.loader import DataLoader
@@ -12,6 +13,10 @@ from typing import Literal, Optional, Union
 
 class KEGG():
     def __init__(self, relation_filepath:str, counts_data=None, get_counts:bool=True, coo_pathway:bool=False, verbose:bool=True):
+        # get kwargs
+        sig = inspect.signature(type(self).__init__)
+        self._orig_kwargs = capture_kwargs(sig, self, relation_filepath, counts_data, get_counts, coo_pathway, verbose)
+
         vprint('# #### KEGG() ####', verbose=verbose)
         ensg_filter = counts_data.ensg_complete if counts_data is not None else None
         self.relation, self.ensg, self.pathway_labels = self._read_relation(relation_filepath, ensg_filter)
@@ -114,6 +119,10 @@ class TCGA():
         get_counts:Union[bool, list[int]]=False, # accepts ensg_filter
         verbose:bool=True
     ):
+        # get kwargs
+        sig = inspect.signature(type(self).__init__)
+        self._orig_kwargs = capture_kwargs(sig, self, tcga_project, tcga_dir, gene_name_path, keep_noname, type_col, subtype_col, drop, get_counts, verbose)
+
         # paths for read
         self.counts_path = Path(tcga_dir) / f'TCGA-{tcga_project}_gene_counts.csv'
         self.metadata_path = Path(tcga_dir) / f'TCGA-{tcga_project}_metadata.csv'
@@ -131,9 +140,6 @@ class TCGA():
             self.get_counts(ensg_filter=self.ensg_complete, verbose=verbose)
         elif get_counts is not False:
             self.get_counts(ensg_filter=get_counts, verbose=verbose)
-
-    def __str__(self):
-        return dict_summary(self.__dict__)
     
     def _get_metadata(self, df_complete:DataFrame, type_col:Optional[str], subtype_col:Optional[str], drop:Union[str,list[str],None]) -> DataFrame:
         '''
@@ -224,14 +230,19 @@ class TCGA():
             self.x_labels = ensg
 
         vprint('# #### TCGA() ####', verbose=verbose)
-        vprint(self, verbose=verbose)
+        vprint(dict_summary(self.__dict__), verbose=verbose)
 
-class Preprocessor():
-    def __init__(self, counts_data, edge_data=None, pathway_data=None, class_wt_method:Literal['inverse','inverse_log']='inverse_log', verbose:bool=True):
+class DataWrapper():
+    def __init__(self, counts_data, edge_data=None, pathway_data=None, verbose:bool=True):
+        # get params
+        self.counts_params = counts_data._orig_kwargs
+        self.edge_params = edge_data._orig_kwargs
+        self.pathway_params = None if (edge_data == pathway_data) else pathway_data._orig_kwargs
+
         vprint('# #### DataWrapper() ####', verbose=verbose)
         # counts
         self.x = counts_data.x
-        self.y = counts_data.y
+        self.y = counts_data.y.to(torch.long)
         self.x_labels = counts_data.x_labels
         self.y_labels = counts_data.y_labels
 
@@ -252,39 +263,23 @@ class Preprocessor():
         self.num_edges, self.num_edge_features = self.edge_attr.shape if edge_data is not None else (None, None)
         self.num_pathways = len(self.pathway_labels)
 
-        # get class_weights
-        self.class_weights = self._get_class_weights(self.y, class_wt_method)
-
         vprint(self, verbose=verbose)
 
     def __str__(self):
         return dict_summary(self.__dict__)
 
-    def _get_class_weights(self, y, class_wt_method:Literal['inverse','inverse_log']):
-        num_classes = y.max().item() + 1
-        
-        # count per class
-        count = torch.bincount(y, minlength=num_classes)
-
-        # get class weights
-        if class_wt_method=='inverse_log':
-            class_weights = 1/torch.log1p(count)
-        else:
-            class_weights = 1/count
-
-        # normalize
-        class_weights = num_classes * class_weights / class_weights.sum()
-
-        return class_weights    
-
 class GraphDataset(InMemoryDataset):
-    def __init__(self, preprocessor, verbose:bool=True):
+    def __init__(self, counts_data, edge_data, pathway_data=None, verbose:bool=True):
         super().__init__()
-        self.x = preprocessor.x
-        self.y = preprocessor.y.to(torch.long)
-        self.edge_index = preprocessor.edge_index
-        self.edge_attr = preprocessor.edge_attr
-        self.device = self.x.device
+
+        # construct wrapper
+        self.wrapper = DataWrapper(counts_data, edge_data, pathway_data, verbose)
+
+        # extract data for graph dataset
+        self.x = self.wrapper.x
+        self.y = self.wrapper.y
+        self.edge_index = self.wrapper.edge_index
+        self.edge_attr = self.wrapper.edge_attr
 
         # process data
         self.data, self.slices = self._process_data()
@@ -319,35 +314,11 @@ class GraphDataset(InMemoryDataset):
 
         return data, slices
     
-    def print_dict(self):
-        # get first graph in dataset
-        data = self[0] 
-
-        # format msg
-        out = '# #### GraphDataset(), Dataset (Dict) ####\n'
-        out += dict_summary(self.__dict__)
-        out += '\n# #### GraphDataset(), Data (Dict) ####\n'
-        out += dict_summary(data.__dict__)
-
-        # print msg
-        print(out)
-
     def print_dims(self):
         # get first graph in dataset
         data = self[0]
 
-        # get dims
-        dataset_dims = {
-            'num_graphs (len)':len(self),
-            'num_node_features':self.num_node_features,
-            'num_edge_features':self.num_edge_features,
-        }
-        data_dims = {
-            'num_nodes':data.num_nodes,
-            'num_edges':data.num_edges,
-            'num_node_features':data.num_node_features,
-            'num_edge_features':data.num_edge_features,
-        }
+        # summmarize graph information
         data_summary = {
             'Average node degree': data.num_nodes / data.num_edges,
             'Has isolated nodes': data.has_isolated_nodes(),
@@ -356,17 +327,21 @@ class GraphDataset(InMemoryDataset):
         }
 
         # create msg
-        out = '# #### GraphDataset(), Dataset ####\n'
-        out += dict_summary(dataset_dims)
-        out += '\n# #### GraphDataset(), Data ####\n'
-        out += dict_summary(data_dims)
-        out += '\n# #### GraphDataset(), Summary ####\n'
+        out = '\n# #### GraphDataset(), Summary ####\n'
         out += dict_summary(data_summary)
 
         # print msg
         print(out)
 
-def get_toy_databatch(dataset:GraphDataset, generator, batch_size:int = 64):
+def get_toy_databatch(dataset:DataWrapper, device:str, batch_size:int = 64):
+    # init seed, generator
+    generator = torch.Generator(device=device)
+
+    # generate loader
     loader = DataLoader(dataset, batch_size=batch_size, shuffle=True, generator=generator)
+
+    # get batches
     batches = [(step, data) for step, data in enumerate(loader)]
-    return batches[0][1] # return batch 0 data
+
+    # return batch 0 data
+    return batches[0][1] 

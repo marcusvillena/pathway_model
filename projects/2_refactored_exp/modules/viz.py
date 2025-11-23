@@ -1,3 +1,4 @@
+import pandas as pd
 import numpy as np
 import torch
 
@@ -20,6 +21,121 @@ from sklearn.manifold import TSNE
 
 from torch_geometric.loader import DataLoader
 from typing import Literal
+
+## Expt viz
+def dev_plot(dev_df:pd.DataFrame, summary_df:pd.DataFrame, configs:list=None, metrics:list=None):
+    figs = {}
+
+    if isinstance(configs, list):
+        config_list = configs
+    else:
+        config_list = dev_df['config'].unique()
+
+    # for each config
+    for config in config_list:
+
+        figs[config] = {}
+        
+        # df filtered for config
+        df_config = dev_df[dev_df['config']==config]
+
+        if isinstance(metrics, list):
+            metric_list = metrics
+        else:
+            metric_list = df_config['metric'].unique()
+
+        # for each metric
+        for metric in metric_list:
+            # filter and copy df for metric
+            df_metric = df_config[df_config['metric'] == metric].copy()
+
+            # rename
+            df_metric['stage'] = df_metric['stage'].replace({'train':'Training', 'val':'Validation'})
+
+            # init figure
+            plt.figure(figsize=(8, 5))
+
+            # plot dev
+            sns.lineplot(data=df_metric, x='epoch', y='value', hue='stage')
+
+            # get test vals
+            test = summary_df[(summary_df['config'] == config) & (summary_df['metric'] == metric)] # get test vals
+            test_mean = test['mean'].values[0]
+            test_std = test['std'].values[0]
+
+            # plot test mean (line)
+            plt.axhline(
+                y=test_mean,
+                color='green',
+                linestyle='--',
+                label='Test'
+            )
+
+            # plot test std (area)
+            plt.fill_between(
+                x = df_metric['epoch'],
+                y1 = test_mean - test_std,
+                y2 = test_mean + test_std,
+                color='green',
+                alpha=0.2,
+            )
+
+            # add test label
+            plt.text(
+                x = max(df_metric['epoch']),
+                y = test_mean,
+                s = f'{test_mean:.4f} ± {test_std:.4f}',
+                va = 'bottom',
+                ha = 'right',
+                color = 'green',
+                bbox = dict(boxstyle='round,pad=0.2', facecolor='white', edgecolor='green', alpha=0.7)
+            )
+
+            # formatting
+            plt.title(f'{config.capitalize()} | {metric.capitalize()}')
+            plt.xlabel('Epoch')
+            plt.ylabel(metric.capitalize())
+            plt.legend(title='Stage')
+            plt.tight_layout()
+            
+            # # make config subfolder
+            # subfolder = self.folder / f'{trainer}' / f'{config}'
+            # subfolder.mkdir(parents=True, exist_ok=True)
+
+            # # Save the plot object (the current figure)
+            # fig = plt.gcf()
+            # figs[trainer][config][metric] = fig
+            # # fig.savefig(subfolder / f'{trainer}_{config}_{metric}.svg')
+            # plt.close()
+
+def test_plot(test_df:pd.DataFrame, configs:list=None, metrics:list=None):
+    # set defaults
+    configs = configs if isinstance(configs, list) else test_df['config'].unique()
+    metrics = metrics if isinstance(metrics, list) else test_df['metric'].unique()
+
+    # get n_configs (for figsize)
+    n_configs = len(configs)
+
+    # plot per metric
+    for metric in metrics:
+
+        # filter df for metric and configs
+        metric_df = test_df[test_df['config'].isin(configs)]
+        metric_df = metric_df[metric_df['metric'] == metric]
+
+        plt.figure(figsize=(8, 0.5*n_configs))
+        ax = sns.pointplot(
+            data=metric_df, 
+            y='config', 
+            x='value', 
+            errorbar=('ci',95), 
+            linestyle='none'
+        )
+
+        ax.set_xlabel(metric.capitalize())
+        ax.set_ylabel('Configuration')
+
+## Single model viz
 
 class ModelOutput():
     def __init__(self, model, dataset, batch_size:int=64):

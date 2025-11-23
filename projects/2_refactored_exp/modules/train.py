@@ -1,41 +1,45 @@
-import copy
+# general
 import torch
 import torch.nn as nn
-import torch.optim as optim
+from .utils import capture_kwargs, clean_name, filter_kwargs, input_to_dict, reshape
 
-from torchmetrics.functional import (
-    mean_squared_error,
-    mean_absolute_error,
-    r2_score
-)
-
-from .data import GraphDataset
-from .utils import reshape
-
-from torch import Generator, Tensor
+# loader
 from torch.utils.data import random_split
 from torch_geometric.loader import DataLoader
-from tqdm import tqdm
-from typing import Literal, Union
 
-## DataloaderMean
+# trainer
+from tqdm.auto import tqdm
+import copy
+import inspect
+import torch.optim as optim
+
+# experiment
+from datetime import datetime
+from pathlib import Path
+from scipy import stats
+import json
+import pandas as pd
 import numpy as np
-import matplotlib.pyplot as plt
-import matplotlib.colors as mcolors
-import statsmodels.api as sm
-from .utils import input_to_dict
-from typing import Optional, Sequence
 
-## NBReconTrainer
-from .loss import NBLoss, UncertaintyLoss
+# grid 
+import itertools
 
-# NBClassTrainer
-from torchmetrics.functional.classification import multiclass_accuracy
+# trainer metrics
+from torchmetrics.functional.classification import accuracy, precision, recall, f1_score, auroc
 
+# typing
+from .data import DataWrapper
+from torch import Generator, Tensor
+from typing import Literal, Optional, Sequence, Union
 
-# Dataloaders
+## Main
+
 class Loader():
-    def __init__(self, dataset:GraphDataset, generator:Generator, batch_size:int=16, val_size:int=0.15, test_size:int=0.15):
+    def __init__(self, dataset:DataWrapper, device:str, batch_size:int=16, val_size:int=0.15, test_size:int=0.15, stats_kwargs:dict=None):
+        # init seed, generator
+        self.seed = torch.seed()
+        generator = torch.Generator(device=device).manual_seed(self.seed)
+
         # format Xy as dataset
         self.dataset = dataset
 
@@ -52,172 +56,130 @@ class Loader():
         self.val_loader = DataLoader(val_dataset, batch_size=batch_size, shuffle=False, generator=generator)
         self.test_loader = DataLoader(test_dataset, batch_size=batch_size, shuffle=False, generator=generator)
 
-class DataloaderMean():
-    def __init__(self, loader, num_nodes, num_features):
-        self.loader = loader
-        self.num_nodes = num_nodes
-        self.num_features = num_features
+        # get stats
+        stats_kwargs = {} if stats_kwargs is None else stats_kwargs
+        self.stats = self.get_stats(loader=self.train_loader, **stats_kwargs)
 
-    def get_mean(self, target_class:Optional[Union[int, Sequence[int]]]=None, to_bnf:bool=True):
-            num_nodes = self.num_nodes
-            num_features = self.num_features
-            loader = self.loader
+    def get_stats(self, loader:DataLoader, target_class:Optional[Union[int, Sequence[int]]]=None):
+        # dims
+        num_nodes = self.dataset[0].num_nodes
+        num_features = self.dataset[0].num_features
+        num_classes = self.dataset.num_classes
 
-            # init trackers
-            total = torch.zeros(num_nodes * num_features)
-            count = 0
+        # init trackers
+        sum_x = torch.zeros(num_nodes, num_features)
+        sum_x2 = torch.zeros(num_nodes, num_features)
+        sum_logx = torch.zeros(num_nodes, num_features)
+        sum_logx2 = torch.zeros(num_nodes, num_features)
+        count = 0
+        class_counts = torch.zeros(num_classes, dtype=torch.long)
 
-            # ensure target_class is list -> tensor
-            if isinstance(target_class, int): # if int (one class)
-                target_class = torch.tensor([target_class])
-            elif target_class is not None: # if iterable (multiclass)
-                target_class = torch.tensor(list(target_class))
 
-            # compute for all batches in loader
-            for batch in loader:
-                data = input_to_dict(batch)
-                x = reshape(data['x'], 'b,n*f', num_nodes=num_nodes, num_features=num_features) # (b,n*f)
-                labels = data['y']  # (b,)
+        # ensure target_class is list -> tensor
+        if isinstance(target_class, int): # if int (one class)
+            target_class = torch.tensor([target_class])
+        elif target_class is not None: # if iterable (multiclass)
+            target_class = torch.tensor(list(target_class))
 
-                # apply class filtering if applicable
-                if target_class is not None:
-                    mask = torch.isin(labels, target_class)
-                    if not mask.any():
-                        continue
-                    x = x[mask]
+        # compute for all batches in loader
+        for batch in loader:
+            data = input_to_dict(batch)
+            x = reshape(data['x'], 'b,n,f', num_nodes=num_nodes, num_features=num_features) # (b,n,f)
+            y = data['y']  # (b,)
 
-                # skip batch if empty (avoid div0)
-                batch_size = x.shape[0]
-                if batch_size == 0:
+            # apply class filtering if applicable
+            if target_class is not None:
+                mask = torch.isin(y, target_class)
+                if not mask.any():
                     continue
-                
-                # add to running
-                total += x.sum(dim=0)
-                count += batch_size
+                x = x[mask]
 
-            # ensure samples present (avoid div0); compute mean
-            assert count > 0,  ValueError("No samples found for the specified class(es).")
-            mean = total / count
+            # skip batch if empty (avoid div0)
+            if x.size(0) == 0:
+                continue
+            
+            # get log
+            log_x = torch.log1p(x)
 
-            # format to b,n,f
-            if to_bnf:
-                mean = mean.view(1, -1, 1)
+            # add to running
+            sum_x += x.sum(dim=0) # (n,f)
+            sum_x2 += (x**2).sum(dim=0) # (n,f)
+            sum_logx += log_x.sum(dim=0) # (n,f)
+            sum_logx2 += (log_x**2).sum(dim=0) # (n,f)
+            count += x.size(0)
+            class_counts += torch.bincount(y, minlength=class_counts.numel())
 
-            return mean
-    
-    def plot_target_vs_global(self, target_class:Union[int, Sequence[int]], labels:Optional[Sequence[str]]=None, as_log:bool=True):
-        # get means
-        x_mean = self.get_mean(target_class=None).cpu().numpy().reshape(-1) # global as y
-        x_recon_mean = self.get_mean(target_class=target_class).cpu().numpy().reshape(-1) # target as x
+        # ensure samples present (avoid div0)
+        if count == 0:
+            raise ValueError("No samples found for the specified class(es).")
 
-        # log if applic
-        if as_log:
-            x_mean = np.log(x_mean+1)
-            x_recon_mean = np.log(x_recon_mean+1)
-            mu_label = 'log(μ)'
-        else:
-            mu_label = 'μ'
-
-        #### plot ####
+        # compute mean
+        mean = sum_x / count
+        log_mean = sum_logx / count
         
-        # get MAE
-        recon_error = np.abs(x_mean - x_recon_mean)
-        error_label = "Mean absolute error"
+        # compute std
+        var = torch.clamp((sum_x2/count) - (mean.pow(2)), min=0.0)
+        log_var = torch.clamp((sum_logx2/count) - (log_mean.pow(2)), min=0.0)
 
-        # Normalize error for size and color
-        size_min, size_max = 20, 200
-        size = size_min + (size_max - size_min) * (recon_error - recon_error.min()) / (recon_error.ptp() + 1e-8)
-        norm = mcolors.Normalize(vmin=recon_error.min(), vmax=recon_error.max())
-        cmap = plt.colormaps['viridis']
-        colors = cmap(norm(recon_error))
+        std = torch.clamp(torch.sqrt(var), min=1e-8)
+        log_std = torch.clamp(torch.sqrt(log_var), min=1e-8)
 
-        # Darkened edge colors
-        dark_edge_colors = colors.copy()
-        dark_edge_colors[:, :3] *= 0.5
-        dark_edge_colors[:, 3] = 1
+        # add batch dim
+        mean = mean.unsqueeze(0)
+        std = std.unsqueeze(0)
+        log_mean = log_mean.unsqueeze(0)
+        log_std = log_std.unsqueeze(0)
 
-        # Fit OLS model
-        X = sm.add_constant(x_mean)
-        model = sm.OLS(x_recon_mean, X).fit()
-        intercept, slope = model.params
-        r_squared = model.rsquared
-        f_statistic = model.fvalue
-        p_value = model.f_pvalue
+        return {
+            'mean': mean,
+            'std': std,
+            'log_mean': log_mean,
+            'log_std': log_std,
+            'class_counts': class_counts
+        }
 
-        # Prepare regression line
-        x_vals = np.linspace(x_mean.min(), x_mean.max(), 100)
-        regression_line = intercept + slope * x_vals
-
-        # Begin plot
-        plt.figure(figsize=(10, 8))
-
-        # Scatter plot
-        sc = plt.scatter(x_mean, x_recon_mean, c=recon_error, cmap='viridis',
-                        edgecolor=dark_edge_colors, alpha=0.4, s=size)
-
-        # y = x reference line
-        plt.plot(x_vals, x_vals, color='red', linestyle='--', label='Reference line (y = x)', linewidth=1)
-
-        # Regression line
-        plt.plot(x_vals, regression_line, color='orange', linestyle='-', label=f'Regression line', linewidth=1)
-
-        # Colorbar
-        cbar = plt.colorbar(sc)
-        cbar.set_label(f"{error_label}")
-
-        # Axes labels and layout
-        class_name = labels[target_class] if labels is not None else f'class {target_class}' # class name if prov
-        plt.xlabel(f"{mu_label} of {class_name} (per gene)")
-        plt.ylabel(f"Global {mu_label} (per gene)")
-        plt.axis("equal")
-
-        # Add R², F, and regression equation
-        reg_eq = f"$y = {intercept:.3f} + {slope:.3f}x$"
-        r2_text = f"$R^2$ = {r_squared:.3f}"
-        f_text = f"$F$ = {f_statistic:.1e}"
-        p_text = f"$p$ = {p_value:.1e}" if p_value > 0 else "$p$ < 1e-308"
-
-        annotation_text = f"{reg_eq}\n{r2_text}\n{f_text}\n{p_text}"
-
-        plt.text(0.95, 0.05, annotation_text,
-                transform=plt.gca().transAxes,
-                fontsize=12, ha='right', va='bottom',
-                bbox=dict(facecolor='white', alpha=0.7))
-
-        # Legend for lines
-        plt.legend(loc='upper left')
-
-        plt.tight_layout()
-        plt.show()
-
-# Training
 class Trainer():
-    def __init__(self, model, loss_fn:nn.Module, optimizer_class:optim.Optimizer=optim.Adam, optimizer_kwargs:dict={}, report_metrics=['loss'], verbose:bool=False):
-        # assign inst vars
-        self._orig_model = model
-        self.loss_fn = loss_fn
-        self.report_metrics = report_metrics
-        self.verbose = verbose
-        
-        # define optimizer, paired with self.model
-        self._optimizer_class = optimizer_class
-        self._optimizer_kwargs = optimizer_kwargs
+    def __init__(
+        self, 
+        lr:float, 
+        loss_class:type[nn.Module], 
+        loss_kwargs:dict|None = None, 
+        optim_class:type[optim.Optimizer] = optim.Adam, 
+        optim_kwargs:dict|None = None, 
+        report_metrics:list[str]|None = None,
+        **kwargs 
+    ):
+        # get kwargs
+        sig = inspect.signature(type(self).__init__)
+        self._orig_kwargs = capture_kwargs(sig, self, lr, loss_class, loss_kwargs, optim_class, optim_kwargs, report_metrics, **kwargs)
 
-    def run(self, loader:Loader, num_epochs:int):
-        # initiate loader, predefined model & optimizer
+        # defaults
+        self.lr = lr
+        self.loss_class = loss_class
+        self.loss_kwargs = {} if loss_kwargs is None else loss_kwargs
+        self.optim_class = optim_class
+        self.optim_kwargs = {} if optim_kwargs is None else optim_kwargs
+        self.report_metrics = ['loss'] if report_metrics is None else report_metrics
+
+    def run(self, model:nn.Module, loader:Loader, num_epochs:int, verbose:bool=False):
+        # get loader
         self.loader = loader
-        self.model = self._orig_model.clone() if hasattr(self._orig_model, 'clone') else copy.deepcopy(self._orig_model)
-        self.optimizer = self._optimizer_class(self.model.parameters(), **self._optimizer_kwargs)
 
-        # verbose, use tqdm
-        if self.verbose == True:
-            pbar = tqdm(range(num_epochs))
-        else:
-            pbar = range(num_epochs)
+        # initiate loss
+        self.loss_fn = self._init_loss(self.loader)
+
+        # initiate model
+        self.model = model.clone() if hasattr(model, 'clone') else copy.deepcopy(model)
+        if hasattr(self.model, 'init_with_loader'):
+            self.model.init_with_loader(self.loader)
+
+        # init optimizer (requires model)
+        self.optimizer = self.optim_class(self.model.parameters(), lr=self.lr, **self.optim_kwargs)        
 
         # train, val loop
         self.dev_metrics = {}
 
+        pbar = tqdm(range(num_epochs), leave=verbose)
         for epoch in pbar:
             # training
             train_metrics, _ = self._run_phase('train', self.loader.train_loader)
@@ -233,17 +195,16 @@ class Trainer():
             val_report = self._generate_report(val_metrics, self.report_metrics)
 
             # update pbar with report
-            if self.verbose == True:
-                epoch_report = f'Epoch {epoch:<8}' + f'Train: {train_report}' + 8*' ' + f'Val: {val_report}'
-                pbar.set_postfix_str(epoch_report)
+            epoch_report = f'Epoch {epoch+1}/{num_epochs}, Train: {train_report},    Val: {val_report}'
+            pbar.set_postfix_str(epoch_report)
 
         # test
         self.test_metrics, self.test_values = self._run_phase('eval', self.loader.test_loader)
 
         # print test report
-        if self.verbose == True:
-            test_report = self._generate_report(self.test_metrics, self.report_metrics)
-            tqdm.write(f'Test\t {test_report}\n')
+        self.test_report = self._generate_report(self.test_metrics, self.report_metrics)
+        if verbose:
+            tqdm.write(f'Test\t {self.test_report}\n')
 
         # mark model as trained
         if hasattr(self.model, 'is_trained'):
@@ -252,7 +213,7 @@ class Trainer():
     def _generate_report(self, metrics:dict, report_metrics:list):
         # generate report
         report = (4*' ').join(
-            f'{metric}={metrics[metric]:<.4f}'
+            f'{metric}={metrics[metric]:.4f}'
             for metric in report_metrics
             if metric in metrics
         )
@@ -338,12 +299,12 @@ class Trainer():
         # fallback
         return item
 
-    #### change in child objects if needed: ####
+    #### change in child objects: ####
+
+    def _init_loss(self, loader:Loader):
+        return self.loss_class(**self.loss_kwargs)
 
     def _compute_loss(self, batch): # change in child
-        # default, assume 1 item/Tensor (x)
-        x = y = batch
-
         # extract x,y if applicable
         if isinstance(batch, (tuple,list)): # tuple, list
             if len(batch) > 0:
@@ -375,80 +336,345 @@ class Trainer():
 
         return metrics, values
 
-class NBReconTrainer(Trainer):
-    def _compute_loss(self, batch):
-        # extract x
-        data = input_to_dict(batch)
-        x = data.get('x')
+class Experiment():
+    def __init__(
+        self,
+        device:str,
+        num_trials:int,
+        num_epochs:int,
+        dataset:DataWrapper,
+        batch_size:int=16,
+        val_size:int=0.15,
+        test_size:int=0.15,
+    ): 
+        self.device = device
+        self.num_trials = num_trials
+        self.num_epochs = num_epochs
+        self.dataset = dataset
+        self.batch_size = batch_size
+        self.val_size = val_size
+        self.test_size = test_size
 
-        # forward pass
-        out = self.model(batch)
+        # init configs
+        self.models = {}
+        self.configs = {}
 
-        # get params
-        lfc = out.get('lfc') # mse
-        lfc_recon = out.get('lfc_recon') # mse
-        x_recon = out.get('x_recon')
-        mu = out.get('mu') # nb
-        theta = out.get('theta')
+    def add_config(self, name:str, model:nn.Module, trainer:Trainer):
+        # ensure name is string
+        name = str(name)
 
-        log2_x = torch.log2(x + 1)
-        log2_x_recon = torch.log2(x_recon + 1)
+        # generate unique name if duplicates
+        if name in self.configs:
 
-        # compute loss
-        recon_loss = self.loss_fn(log2_x, log2_x_recon)
-        lfc_loss = self.loss_fn(lfc, lfc_recon)
-        nb_loss = NBLoss()(x, mu, theta)
-        
-        criterion = UncertaintyLoss(num_tasks=3)
-        loss = criterion([lfc_loss, recon_loss, nb_loss])
-        # loss = lfc_loss
+            # loop to find unique name
+            i = 0
+            candidate = f'{name}_{i}'
 
-        return loss, out
+            while candidate in self.configs:
+                i+=1
+                candidate = f'{name}_{i}'
+            
+            # print warning, set candidate as new name
+            print(f'Warning: {name} already in configs, adding as {candidate}')
+            name = candidate
+            
+        # add to dicts
+        self.models[name] = model
+        self.configs[name] = trainer
+
+    def add_grid(self, model_grid:nn.Module|dict[str,nn.Module], trainer_grid:Trainer|dict[str,Trainer]):
+        # convert to dict if instance provided
+        if isinstance(model_grid, nn.Module):
+            model_grid = {'':model_grid}
+        if isinstance(trainer_grid, Trainer):
+            trainer_grid = {'':trainer_grid}
+
+        # iterate over grids
+        for model_name, model in model_grid.items():
+            for trainer_name, trainer in trainer_grid.items():
+                
+                # build name; fallback as 'config' if both == ''
+                name_parts = []
+                if model_name != '': name_parts.append(model_name) 
+                if trainer_name != '': name_parts.append(trainer_name)
+                name = '_'.join(name_parts) if name_parts else 'config'
+
+                # add config
+                self.add_config(name, model, trainer)
+
+    def run_experiment(self, comment:str=None, save_csv:bool=False, save_params:bool=False, save_model:bool=False, verbose:bool=True, loader_kwargs:dict=None):
+        loader_kwargs = {} if loader_kwargs is None else loader_kwargs
+
+        # make folder
+        self.folder = self._get_folder(comment) if True in (save_csv, save_params, save_model) else None
+ 
+        # init trackers
+        dev_metrics = {}
+        test_metrics = {}
+        seeds = []
+
+        # trial loop
+        trial_pbar = tqdm(range(self.num_trials), leave=verbose)
+        trial_pbar.set_postfix_str(f'Experiment {comment}')
+        report = f'Trial 1/{self.num_trials}'
+        for trial in trial_pbar:
+
+            # init loader per trial
+            trial_loader = Loader(
+                device=self.device,
+                dataset=self.dataset,
+                batch_size=self.batch_size,
+                val_size=self.val_size,
+                test_size=self.test_size,
+                **loader_kwargs
+            )
+
+            # add trial to trackers
+            dev_metrics[trial] = {}
+            test_metrics[trial] = {}
+            seeds.append(trial_loader.seed)
+
+            # for each config
+            config_pbar = tqdm(self.configs.items(), leave=False)
+            for i, (config_name, config) in enumerate(config_pbar):
+                # update pbar
+                report = f'Trial {trial+1}/{self.num_trials}, Config: {i+1}/{len(self.configs)} ({config_name})'
+                config_pbar.set_postfix_str(report)
     
-    def _compute_metrics(self, batch_log:dict): # change in child
-        # init
-        metrics = {}
+                # run config with trial loader
+                config.run(model=self.models[config_name], loader=trial_loader, num_epochs=self.num_epochs)
 
-        # compute loss
-        metrics['loss'] = batch_log['loss']/batch_log['num_batches']
+                # add trial config to trackers
+                dev_metrics[trial][config_name] = config.dev_metrics
+                test_metrics[trial][config_name] = config.test_metrics
 
-        # get outputs
-        x = torch.cat([batch['x'] for batch in batch_log['batch']])
-        y = torch.cat([batch['y'] for batch in batch_log['batch']])
-        x_recon = torch.cat([batch['x_recon'] for batch in batch_log['out']])
-        mu = torch.cat([batch['mu'] for batch in batch_log['out']])
-        theta = torch.cat([batch['theta'] for batch in batch_log['out']])
-        lfc = torch.cat([batch['lfc'] for batch in batch_log['out']])
-        lfc_recon = torch.cat([batch['lfc_recon'] for batch in batch_log['out']])
+                # save
+                if save_params or save_model:
+                    subfolder = self.folder / f'{config_name}'
+                    subfolder.mkdir(parents=True, exist_ok=True)
 
-        # scale outputs to log2        
-        log2_x = torch.log2(x + 1)
-        log2_x_recon = torch.log2(x_recon + 1)
-        log2fc = log2_x_recon - log2_x
-        mse = mean_squared_error(log2_x_recon, log2_x)
+                if save_params:
+                    config_params = {'model': config.model._orig_kwargs, 'trainer': config._orig_kwargs}
+                    with open(subfolder / f'{config_name}_params.json', 'w') as f:
+                        json.dump(config_params, f, indent=4, default=str)
 
-        # compute log2 metrics
-        metrics['mean'] = torch.mean(log2fc).item()
-        metrics['std'] = torch.std(log2fc).item()
-        metrics['mae'] = mean_absolute_error(log2_x_recon, log2_x).item()
-        metrics['mse'] = mse.item()
-        metrics['rmse'] = torch.sqrt(mse).item()
-        metrics['r2'] = r2_score(log2_x_recon, log2_x).item()
+                if save_model:
+                    state_dict = config.model.state_dict()
+                    torch.save(state_dict, subfolder / f'{config_name}_trial_{trial}_model.pth')
 
-        # convert values to numpy
-        values = {
-            'y': y.cpu().numpy(),
-            'x': x.cpu().numpy(),
-            'x_recon': x_recon.cpu().numpy(),
-            'mu': mu.cpu().numpy(),
-            'theta': theta.cpu().numpy(),
-            'lfc':lfc.cpu().numpy(),
-            'lfc_recon':lfc_recon.cpu().numpy()
-        }
+                # print report
+                if verbose:
+                    tqdm.write(f'{report},\t {config.test_report}')
+                
+            # save metrics, params per trial
+            self.dev_df = self._format_outputs(dev_metrics, 'dev', save_csv)
+            self.test_df = self._format_outputs(test_metrics, 'test', save_csv)
+            self._save_params(seeds, save_params)
+        
+        # get summary
+        self.summary = self._get_summary(self.test_df, save_csv)
 
-        return metrics, values
+    def _get_folder(self, comment:str=None):
+        # get date, time
+        date = datetime.now().strftime("%Y-%m-%d")
+        time = datetime.now().strftime("%Hh%Mm%Ss").lower()
 
-class NBClassTrainer(Trainer):
+        # get dir name
+        dir_name = f'{date}_{time}'
+
+        if (comment != None) & (type(comment) == str): 
+            dir_name = dir_name + f'_{comment}' # append comment if applicable
+
+        # create folder
+        folder = Path(f'./output/{dir_name}')
+        folder.mkdir(parents=True, exist_ok=True)
+
+        return folder
+    
+    def _format_outputs(self, x:dict, method:Literal['dev','test','values'], save_csv:bool=False):
+        if method in ['dev', 'test']:
+            # reshape rows
+            if method == 'dev':
+                rows = [
+                    {
+                        'trial': trial,
+                        'config': config,
+                        'epoch': epoch,
+                        'stage': stage,
+                        'metric': metric,
+                        'value': value 
+                    }
+                    for trial, configs in x.items()
+                    for config, epochs in configs.items()
+                    for epoch, stages in epochs.items()
+                    for stage, metrics in stages.items()
+                    for metric, value in metrics.items()
+                ]
+
+            elif method == 'test':
+                rows = [
+                    {
+                        'trial': trial,
+                        'config': config,
+                        'metric': metric,
+                        'value': value
+                    }
+                    for trial, configs in x.items()
+                    for config, metrics in configs.items()
+                    for metric, value in metrics.items()
+                ]
+
+            # convert to df, write to csv
+            df = pd.DataFrame(rows)
+
+            # save csv
+            if save_csv:
+                df.to_csv(self.folder / f'{method}.csv', index=False)
+
+            return df
+        
+        elif method == 'values':
+            out = {}
+
+            for trial, configs in x.items():
+                for config_name, _variables in configs.items():
+                    for _variable, value in _variables.items():
+                        # initialize config dict if not already made
+                        if _variable not in out:
+                            out[_variable] = {}
+
+                        # initialize var list if not already made
+                        if config_name not in out[_variable]:
+                            out[_variable][config_name] = []
+
+                        # append value to list
+                        out[_variable][config_name].append(value)
+            
+            return out
+
+    def _get_summary(self, df:pd.DataFrame, save_csv:bool=False):
+        # mean, std, ci if trials > 1
+        if self.num_trials > 1:
+            # ci helper fxn
+            def _get_ci(series:pd.Series, confidence:float=0.95):
+                n = series.count()
+                sem = stats.sem(series, nan_policy='omit')
+                ci = sem * stats.t.ppf((1 + confidence) / 2., n - 1)
+                return ci
+
+            # group df, get summary stats
+            summary_df = df.groupby(['config','metric'])['value'].agg(mean='mean', std='std', ci=_get_ci).reset_index()
+
+        # 1 trial only, std and ci can't be calculated
+        else:
+            summary_df = df.groupby(['config','metric'])['value'].agg(mean='mean').reset_index()
+
+        # save csv
+        if save_csv:
+            summary_df.to_csv(self.folder / f'summary.csv', index=False)
+
+        return summary_df
+
+    def _save_params(self, seeds:list[int]|None, save_params:bool=False):
+        if save_params:
+            # get params
+            counts_params = self.dataset.wrapper.counts_params
+            edge_params = self.dataset.wrapper.edge_params
+            pathway_params = self.dataset.wrapper.pathway_params
+            expt_params = {
+                'num_trials':self.num_trials,
+                'num_epochs':self.num_epochs,
+                'batch_size':self.batch_size,
+                'val_size':self.val_size,
+                'test_size':self.test_size,
+                'seeds':seeds
+            }
+
+            # collect to dict
+            params = {
+                'counts': counts_params,
+                'edge': edge_params,
+                'pathway': pathway_params,
+                'experimetn': expt_params
+            }
+
+            # save
+            with open(self.folder / f'params.json', 'w') as f:
+                json.dump(params, f, indent=4, default=str)
+
+
+def grid(obj, *, prefix:str=None, suffix:str=None, **param_lists):
+    # init model dict
+    objs = {}
+
+    # get keys (each param)
+    keys = list(param_lists.keys())
+
+    # filter kwargs (safe func/class.__init__)
+    obj = filter_kwargs(obj)
+
+    # for each value combination
+    for values in itertools.product(*param_lists.values()):
+        # get params
+        params = dict(zip(keys,values))
+
+        # clean & build name
+        name = '_'.join([f'{clean_name(k)}{clean_name(v)}' for k,v in params.items()])
+
+        # add prefix, suffix
+        if prefix is not None:
+            name = f'{prefix}_{name}'
+        if suffix is not None:
+            name = f'{name}_{suffix}'
+
+        # build config name & model
+        objs[name] = obj(**params)
+
+    return objs
+
+## Trainers
+
+class ClassifTrainer(Trainer):
+    def __init__(
+        self, 
+        lr:float, 
+        loss_class:type[nn.Module],
+        loss_kwargs:dict|None = None, 
+        optim_class:type[optim.Optimizer] = optim.Adam, 
+        optim_kwargs:dict|None = None, 
+        report_metrics:list[str]|None = None, 
+        *,
+        weight_method:Literal['none', 'balanced']|None = None,
+    ):
+        super().__init__(lr, loss_class, loss_kwargs, optim_class, optim_kwargs, report_metrics, weight_method=weight_method)
+        self.weight_method = 'none' if weight_method is None else weight_method
+    
+    def _init_loss(self, loader:Loader):
+        # get counts
+        class_counts = loader.stats['class_counts']
+        count = class_counts.sum()
+        num_classes = class_counts.numel()
+
+        # compute class weight
+        if self.weight_method == 'none': # no weighting
+            weight = None
+
+        elif self.weight_method == 'balanced': # scikitlearn approach
+            weight = count / (num_classes * class_counts) 
+            weight = weight / weight.mean() # normalize, mean = 1
+
+        else:
+            raise ValueError(f"weight_method should be in ['none','balanced'], got: {self.weight_method}")
+
+        # if weights needed externally
+        self.class_weight = weight
+
+        # construct loss function
+        if self.class_weight is None:
+            return self.loss_class(**self.loss_kwargs)
+        else:
+            return self.loss_class(weight=self.class_weight, **self.loss_kwargs)
+
     def _compute_loss(self, batch):
         # extract y
         data = input_to_dict(batch)
@@ -456,58 +682,46 @@ class NBClassTrainer(Trainer):
 
         # forward pass
         out = self.model(batch)
-
-        # get params
         logits = out.get('y_logits')
-
 
         # compute loss
         loss = self.loss_fn(logits, y)
 
-        if self.model.nb:
-            x = data.get('x')
-            mu = out.get('mu') # nb
-            theta = out.get('theta')
-            nb_loss = NBLoss()(x, mu, theta)
-            criterion = UncertaintyLoss(num_tasks=2)
-
-            loss = criterion([loss, nb_loss])
-
         return loss, out
-
+    
     def _compute_metrics(self, batch_log):
         # init
         metrics = {}
-        values = {}
 
         # compute loss
         metrics['loss'] = batch_log['loss']/batch_log['num_batches']
 
         # get outputs
         x = torch.cat([batch['x'] for batch in batch_log['batch']])
-        mu = torch.cat([batch['mu'] for batch in batch_log['out']])
-        theta = torch.cat([batch['theta'] for batch in batch_log['out']])
-
         y = torch.cat([batch['y'] for batch in batch_log['batch']])
-        # y_logits = torch.cat([batch['y_logits'] for batch in batch_log['out']])
-        # y_probs = torch.cat([batch['y_probs'] for batch in batch_log['out']])
-        y_preds = torch.cat([batch['y_preds'] for batch in batch_log['out']])
+        y_logits = torch.cat([batch['y_logits'] for batch in batch_log['out']])
 
         # compute metrics
-        # metrics['accuracy'] = multiclass_accuracy(y_preds, y, self.model.dims.num_classes, average='none').item()
-        metrics['micro_acc'] = multiclass_accuracy(y_preds, y, self.model.dims.num_classes, average='micro').item()
-        metrics['macro_acc'] = multiclass_accuracy(y_preds, y, self.model.dims.num_classes, average='macro').item()
-        # metrics['weighted_acc'] = multiclass_accuracy(y_preds, y, self.model.dims.num_classes, average='weighted').item() # identical to micro for accuracy
+        kwargs = {
+            'preds':y_logits,
+            'target':y,
+            'task':'multiclass',
+            'num_classes':self.model.dims.num_classes
+        }
+        metrics['accuracy'] = accuracy(average='micro', **kwargs).item()
+        metrics['precision'] = precision(average="macro", **kwargs).item()
+        metrics['recall'] = recall(average='macro', **kwargs).item()
+        metrics['f1'] = f1_score(average="macro", **kwargs).item()
+        metrics['auroc'] = auroc(average="macro", **kwargs).item()
 
+        # get values
         values = {
-            'y': y.cpu().numpy(),
             'x': x.cpu().numpy(),
-            'mu': mu.cpu().numpy(),
-            'theta': theta.cpu().numpy(),
-            'y_preds': y_preds.cpu().numpy()
+            'y': y.cpu().numpy(),
+            'y_logits': y_logits.cpu().numpy(),
         }
 
-        
         return metrics, values
 
-# Experiment
+
+##
