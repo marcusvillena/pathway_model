@@ -1,3 +1,11 @@
+from .utils import clean_name, validate_filter, filter_df
+from pathlib import Path
+from statannotations.Annotator import Annotator
+import itertools
+import json
+
+##
+
 import pandas as pd
 import numpy as np
 import torch
@@ -22,96 +30,310 @@ from sklearn.manifold import TSNE
 from torch_geometric.loader import DataLoader
 from typing import Literal
 
-## Expt viz
-def dev_plot(dev_df:pd.DataFrame, summary_df:pd.DataFrame, configs:list=None, metrics:list=None):
+## Grid Expt viz
+class ConfigLookup(): # requires json
+    def __init__(self, keys:list[str], path:str|Path, configs:list|pd.Series|None=None, use_keypath:bool=False, save:bool=False):
+        path = Path(path)
+
+        # config fallback: use all from summary
+        if configs is None:
+            configs = pd.read_csv(path/'summary.csv')['config'].unique().tolist()
+            
+        # ensure list
+        if not isinstance(keys, list): 
+            keys = [keys]
+        if isinstance(configs, pd.Series):
+            configs = list(configs)
+        elif not isinstance(configs, list):
+            configs = [configs]
+
+        # get keypaths from first config
+        with open(path / configs[0] / f'{configs[0]}_params.json') as f:
+            d = json.load(f)
+        keypaths = self.find_keypaths(keys, d)
+
+        # get values using keypaths
+        self.data = []
+        for config in configs:
+            with open(path / config / f'{config}_params.json') as f:
+                j = json.load(f)
+            d = self.path_to_dict(keypaths, j, use_keypath)
+            d['config'] = config
+            self.data.append(d)
+
+        # convert to dataframe
+        self.data = pd.DataFrame(self.data)
+
+        # save to csv
+        self.keys = keys
+        self.path = path
+        if save:
+            self.save()
+
+    def save(self):
+        name = '_'.join([clean_name(i) for i in self.keys])
+        self.data.to_csv(self.path / f'{name}_conf.csv', index=False)
+
+    def flatten_dict(self, d:dict, parent=()):
+        out = {}
+
+        if isinstance(d, dict):
+            iterator = d.items()
+        elif isinstance(d, list):
+            iterator = enumerate(d)
+        else:
+            out[parent] = d
+            return out
+
+        for k, v in iterator:
+            path = parent + (k,)
+            if isinstance(v, (dict, list)):
+                out.update(self.flatten_dict(v, path))
+            else:
+                out[path] = v
+
+        return out
+
+    def find_keypaths(self, find, d):
+        if not isinstance(find, list):
+            find = [find]
+
+        flat = self.flatten_dict(d)
+
+        # index by final key
+        index = {}
+        for path in flat.keys():
+            last = path[-1]
+            index.setdefault(last, []).append(path)
+
+        # flatten the result (single list of tuples)
+        result = []
+        for name in find:
+            result.extend(index.get(name, []))
+
+        return result
+
+    def path_to_dict(self, keypaths, d, use_keypath:bool=False):
+        out = {}
+
+        for keypath in keypaths:
+            
+            # start at d
+            current = d
+
+            # traverse path
+            for key in keypath:
+                current = current[key]
+
+            # append final key with value at end of path
+            if use_keypath:
+                out[keypath] = current
+            else:
+                out[key] = current
+
+        return out
+
+def metric_x_point(
+    # data
+    df:pd.DataFrame, cols:list[str], metrics:list[str]|None=None, filters:dict|None=None, 
+    
+    # plot
+    hue:bool=False, strip:bool=False, alpha:float=0.5, figsize:tuple|None=None, dodge:bool=True, 
+
+    # stats
+    sig:Literal['within','between']|bool=True, test:str='t-test_ind'
+):
+    # defaults
+    if filters is None: filters = {}
+    metrics = validate_filter(metrics, df['metric'].unique(), 'metrics')
+    if not isinstance(cols, list): cols = [cols]
+
+    # define plotting func
+    def mxpointplot(data, x:str, metric:str, hue_col=None):
+        
+        # get dodge amounts
+        if dodge and hue:
+            dodge_point = 0.8 - 0.8 / len(data[hue_col].unique())
+        else:
+            dodge_point = False
+
+        # build plots
+        fig, ax = plt.subplots(figsize=figsize)
+        if strip:
+            sns.stripplot(data=data,x=x, y='value', hue=hue_col, ax=ax, alpha=alpha, legend=False, dodge=dodge) #dodge=True)
+        sns.pointplot(data=data, x=x, y='value', hue=hue_col, ax=ax, dodge=dodge_point)
+        ax.set_xlabel(x.capitalize())
+        ax.set_ylabel(metric.capitalize())
+        plt.tight_layout()
+
+        # no sig
+        if not sig:
+            return ax
+
+        # sig, no hue
+        elif hue_col is None:
+            # get pairs
+            levels = sorted(list(data[x].unique()))
+            pairs = list(itertools.combinations(levels,2))
+
+            # skip if no pairs (empty)
+            if not pairs:
+                return ax
+
+            # build annotations if pairs
+            annot = Annotator(ax, pairs, data=data, x=x, y='value')
+  
+        # sig, hue
+        else:
+            # build pairs if none
+            x_levels = sorted(data[x].dropna().unique())
+            h_levels = sorted(data[hue_col].dropna().unique())
+            pairs = []
+            
+            if sig == 'within' or sig == True:
+                pairs = [
+                    ((xv,h1), (xv,h2))
+                    for xv in x_levels
+                    for (h1,h2) in itertools.combinations(h_levels,2)
+                ]
+            elif sig == 'between':
+                pairs = [
+                    ((x1,hv), (x2,hv))
+                    for hv in h_levels
+                    for (x1,x2) in itertools.combinations(x_levels,2)
+                ]
+            else:
+                raise ValueError("sig_mode must be 'within' or 'between'")
+
+            # skip if no pairs (empty)
+            if not pairs:
+                return ax
+            
+            # build annotations if pairs
+            annot = Annotator(ax, pairs, data=data, x=x, y='value', hue=hue_col)
+
+        # add stars, apply annotator
+        annot.configure(test=test, text_format='star', loc='inside', verbose=False, hide_non_significant=True)
+        annot.apply_and_annotate()
+
+        return ax
+
+    # plotting loop
+    for metric in metrics:
+
+        # add metric to filter
+        filters['metric'] = metric
+
+        # filter for metric
+        filt = filter_df(df, filters)
+
+        # plot col1(x) * col2(hue), per col, per metric
+        if hue:
+            perms = list(itertools.permutations(cols, 2))
+            for perm in perms:
+                mxpointplot(data=filt, x=perm[0], metric=metric, hue_col=perm[1])
+
+        # plot across all, per col, per metric
+        else:
+            for col in cols:
+                mxpointplot(data=filt, x=col, metric=metric, hue_col=None)
+
+# Expt
+def devplot(
+    dev:pd.DataFrame,
+    summary:pd.DataFrame|None=None,
+    configs:list[str]|None=None, 
+    metrics:list[str]|None=None,
+    figsize:tuple[int]|None=None,
+    errorbar:Literal['ci','sd']|None='ci',
+    save_folder:str|None=None,
+):
+    # default: plot all
+    configs = validate_filter(configs, dev['config'].unique(), 'configs')
+    metrics = validate_filter(metrics, dev['metric'].unique(), 'metrics')
+
+    # rename stage for legend title
+    dev['stage'] = dev['stage'].replace({'train':'Training', 'val':'Validation'})
+
+    # store figs in dict
     figs = {}
 
-    if isinstance(configs, list):
-        config_list = configs
-    else:
-        config_list = dev_df['config'].unique()
+    # for each config & metric pair
+    for config in configs:
 
-    # for each config
-    for config in config_list:
-
+        # subdict per config
         figs[config] = {}
-        
-        # df filtered for config
-        df_config = dev_df[dev_df['config']==config]
 
-        if isinstance(metrics, list):
-            metric_list = metrics
-        else:
-            metric_list = df_config['metric'].unique()
+        for metric in metrics:
 
-        # for each metric
-        for metric in metric_list:
-            # filter and copy df for metric
-            df_metric = df_config[df_config['metric'] == metric].copy()
-
-            # rename
-            df_metric['stage'] = df_metric['stage'].replace({'train':'Training', 'val':'Validation'})
-
-            # init figure
-            plt.figure(figsize=(8, 5))
+            # filter dev df
+            dev_filt = dev[(dev['config']==config) & (dev['metric']==metric)]
 
             # plot dev
-            sns.lineplot(data=df_metric, x='epoch', y='value', hue='stage')
+            plt.figure(figsize=figsize)
+            sns.lineplot(data=dev_filt, x='epoch', y='value', hue='stage', errorbar=errorbar)
 
-            # get test vals
-            test = summary_df[(summary_df['config'] == config) & (summary_df['metric'] == metric)] # get test vals
-            test_mean = test['mean'].values[0]
-            test_std = test['std'].values[0]
+            # plot test
+            if isinstance(summary, pd.DataFrame):
+            
+                # filter summary df
+                summary_filt = summary[(summary['config']==config) & (summary['metric']==metric)]
 
-            # plot test mean (line)
-            plt.axhline(
-                y=test_mean,
-                color='green',
-                linestyle='--',
-                label='Test'
-            )
+                # plot mean
+                test_mean = summary_filt['mean'].item()
+                plt.axhline(
+                    y=test_mean,
+                    color='green',
+                    linestyle='--',
+                    label='Test'
+                )
+                test_label = f'{test_mean:.4f}' # make label
 
-            # plot test std (area)
-            plt.fill_between(
-                x = df_metric['epoch'],
-                y1 = test_mean - test_std,
-                y2 = test_mean + test_std,
-                color='green',
-                alpha=0.2,
-            )
+                # plot err
+                if isinstance(errorbar, str) and (errorbar in summary.columns):
+                    test_err = summary_filt[errorbar].item()
+                    plt.fill_between(
+                        x = dev_filt['epoch'],
+                        y1 = test_mean - test_err,
+                        y2 = test_mean + test_err,
+                        color='green',
+                        alpha=0.2,
+                    )
+                    test_label = f'{test_label} ± {test_err:.4f}' # add err to label
 
-            # add test label
-            plt.text(
-                x = max(df_metric['epoch']),
-                y = test_mean,
-                s = f'{test_mean:.4f} ± {test_std:.4f}',
-                va = 'bottom',
-                ha = 'right',
-                color = 'green',
-                bbox = dict(boxstyle='round,pad=0.2', facecolor='white', edgecolor='green', alpha=0.7)
-            )
+                # add test label
+                plt.text(
+                    x = max(dev_filt['epoch']),
+                    y = test_mean,
+                    s = test_label,
+                    va = 'center',
+                    ha = 'right',
+                    color = 'green',
+                    bbox = dict(boxstyle='round,pad=0.2', facecolor='white', edgecolor='green', alpha=0.9)
+                )
 
             # formatting
             plt.title(f'{config.capitalize()} | {metric.capitalize()}')
             plt.xlabel('Epoch')
             plt.ylabel(metric.capitalize())
             plt.legend(title='Stage')
-            plt.tight_layout()
-            
-            # # make config subfolder
-            # subfolder = self.folder / f'{trainer}' / f'{config}'
-            # subfolder.mkdir(parents=True, exist_ok=True)
+            plt.tight_layout() 
 
-            # # Save the plot object (the current figure)
-            # fig = plt.gcf()
-            # figs[trainer][config][metric] = fig
-            # # fig.savefig(subfolder / f'{trainer}_{config}_{metric}.svg')
-            # plt.close()
+            # write to dict, save, close
+            fig = plt.gcf()
+            figs[config][metric] = fig
+            if save_folder is not None:
+                path = Path(f'{save_folder}/{config}/')
+                path.mkdir(parents=True, exist_ok=True)
+                fig.savefig(path/f'{config}_{metric}_devplot.svg')
+            plt.close()
 
-def test_plot(test_df:pd.DataFrame, configs:list=None, metrics:list=None):
+    return figs
+
+def testplot(test:pd.DataFrame, configs:list=None, metrics:list=None):
     # set defaults
-    configs = configs if isinstance(configs, list) else test_df['config'].unique()
-    metrics = metrics if isinstance(metrics, list) else test_df['metric'].unique()
+    configs = configs if isinstance(configs, list) else test['config'].unique()
+    metrics = metrics if isinstance(metrics, list) else test['metric'].unique()
 
     # get n_configs (for figsize)
     n_configs = len(configs)
@@ -120,7 +342,7 @@ def test_plot(test_df:pd.DataFrame, configs:list=None, metrics:list=None):
     for metric in metrics:
 
         # filter df for metric and configs
-        metric_df = test_df[test_df['config'].isin(configs)]
+        metric_df = test[test['config'].isin(configs)]
         metric_df = metric_df[metric_df['metric'] == metric]
 
         plt.figure(figsize=(8, 0.5*n_configs))

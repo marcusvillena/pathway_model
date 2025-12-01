@@ -1,5 +1,6 @@
-from .layers import SetPooling, Sequential
-from .utils import attn_dims, build_hidden_dims, cloneable, clone_or_init, input_to_dict, reshape
+
+from .layers import Dims, SetPooling, Sequential
+from .utils import build_hidden_dims, cloneable, clone_or_init, input_to_dict
 import torch
 import torch.nn as nn
 
@@ -8,71 +9,32 @@ from .data import GraphDataset
 from .norm import Normalizer
 from torch import Tensor
 from torch_geometric.data import Data
-from typing import Literal, Union
+from typing import Literal, Union, overload
 
 ## General
-
-@cloneable
-class Dims():
-    def __init__(
-        self, 
-        dataset:GraphDataset, 
-        embed_dim:int=None, 
-        head_dim:int=None, 
-        num_heads:int=1, 
-        method:Literal['node','set','twin']='node', 
-        eps:float=1e-6
-    ):
-        # get datawrapper        
-        self._dataset = dataset.wrapper
-        self.mask = dataset.wrapper.pathway_index # legacy / compatibility
-        self.num_sets = dataset.wrapper.num_pathways # legacy / compatibility
-        self.embed_dim, self.head_dim, self.num_heads = attn_dims(embed_dim, head_dim, num_heads)
-        self.eps = eps
-
-        # for reshaping (mlp2, latent)
-        if method == 'node':
-            self.n_dim = self.num_nodes
-            self.split_dim = None
-        elif method == 'set':
-            self.n_dim = self.num_sets
-            self.split_dim = None
-        elif method == 'twin':
-            self.n_dim = self.num_nodes + self.num_sets
-            self.split_dim = [self.num_nodes, self.num_sets]
-        else:
-            raise TypeError(f'unsupported method: {method}')
-        
-    def __getattr__(self, attr):
-        # return _data attr if called
-        return getattr(self._dataset, attr)
-    
-    def __dir__(self):
-        # list _data attr in IDEs
-        return list(self.__dict__.keys()) + dir(self._dataset)
     
 @cloneable
 class Encoder(nn.Module):
     def __init__(
         self,
-        dims:Dims,
-        method:Literal['node','set']='node', # twin removed for now
+        dims: Dims,
+        method: Literal['node','set'] = 'node', # twin removed for now
 
         # layers
-        norm_class:Normalizer=None,
-        encoder_class:nn.Module=None,
-        pooling_class:SetPooling=None,
+        norm_class: Normalizer | type[Normalizer] = Normalizer,
+        encoder_class: nn.Module | type[nn.Module] = nn.Linear,
+        pooling_class: SetPooling | type[SetPooling] | None = None,
 
         # new layer params
-        hidden_dims:list[int]=None, 
-        act_fn:nn.Module=None, 
-        norm_fn:Literal['batch','layer']=None, 
-        end_fn:Union[bool,nn.Module]=False,
+        hidden_dims: int | list[int] | None = None, 
+        act_fn: nn.Module | None = None, 
+        norm_fn: Literal['batch','layer'] | None = None, 
+        end_fn: bool | nn.Module = False,
 
         # kwargs
-        norm_kwargs:dict=None,
-        encoder_kwargs:dict=None,
-        pooling_kwargs:dict=None,
+        norm_kwargs: dict | None = None,
+        encoder_kwargs: dict | None = None,
+        pooling_kwargs: dict | None = None,
 
         *args, **kwargs
     ):
@@ -90,19 +52,14 @@ class Encoder(nn.Module):
         hidden_dims = build_hidden_dims(self.embed_dim, hidden_dims)
 
         # init norm
-        if norm_class is None:
-            self.norm = Normalizer()
-        else:
-            self.norm = clone_or_init(
-                name='norm_class',
-                obj=norm_class,
-                base_class=nn.Module,
-                builder=lambda cls: cls(**norm_kwargs)
-            )
+        self.norm = clone_or_init(
+            name='norm_class',
+            obj=norm_class,
+            base_class=nn.Module,
+            builder=lambda cls: cls(**norm_kwargs)
+        )
 
         # init layers
-        if encoder_class is None:
-            encoder_class = nn.Linear
         self.node_encoder = clone_or_init(
             name='encoder_class',
             obj=encoder_class,
@@ -122,12 +79,13 @@ class Encoder(nn.Module):
         # init pooling if method != 'node'
         if method == 'node':
             self.node_pooling = None
-        else:
+        elif (method == 'set') and (pooling_class is not None):
             self.node_pooling = clone_or_init(
                 name='pooling_class',
                 obj=pooling_class,
                 base_class=SetPooling,
                 builder = lambda cls: cls(
+                    dims=dims,
                     mask=self.mask,
                     num_features=self.embed_dim,
                     hidden_dims=hidden_dims,
@@ -137,6 +95,9 @@ class Encoder(nn.Module):
                     **pooling_kwargs
                 )
             )
+        else: # method != node, and pooling_class == None
+            raise ValueError(f"'pooling_class' must be a SetPooling type or instance. Got: {type(pooling_class)}")
+
 
     def init_with_loader(self, loader): # pass loader to Encoder -> Norm
         if callable(getattr(self.norm, 'init_with_loader', None)):
@@ -163,7 +124,7 @@ class Encoder(nn.Module):
             h_node = ne_out.pop('x')
 
         # reshape to b,n,f (for pooling)
-        h_node = reshape(h_node, 'b,n,f', num_nodes=self.num_nodes, num_features=self.embed_dim)
+        h_node = h_node.reshape(-1, self.num_nodes, self.embed_dim)
 
         return h_node, ne_out
 
@@ -192,9 +153,11 @@ class Encoder(nn.Module):
     def forward(self, input:Union[Data, Tensor, dict], need_weights:bool=False, **kwargs):
         # extract x
         data = input_to_dict(input)
+        self.orig_shape = data['x'].shape
 
         # normalize
         data = self._normalize(data)
+        x_t = data['x'] # x_true (model space) for reconstr
 
         # node embedding
         x, ne_out = self._encode(data, need_weights, **kwargs)
@@ -207,6 +170,7 @@ class Encoder(nn.Module):
         # format output
         out = {}
         out['x'] = x
+        out['x_t'] = x_t
         # out['mu'] = data.get('mu') # nbloss
         # out['theta'] = data.get('theta') # nbloss
 
@@ -216,28 +180,28 @@ class Encoder(nn.Module):
             out['layer_outs']['np'] = np_out
             out['h_node'] = h_node
             out['h_pool'] = h_pool
-        
+
         return out
 
 @cloneable
 class Latent(nn.Module):
     def __init__(
         self,
-        dims:Dims,
+        dims: Dims,
 
         # layers
-        mlp:Union[bool,nn.Module]=False,
-        pooling_class:SetPooling=SetPooling,
+        mlp: bool | nn.Module = False,
+        pooling_class: SetPooling | type[SetPooling] = SetPooling,
 
         # new layer params
-        hidden_dims:list[int]=None, 
-        act_fn:nn.Module=None, 
-        norm_fn:Literal['batch','layer']=None, 
-        end_fn:Union[bool,nn.Module]=False,   
+        hidden_dims: int | list[int] | None = None, 
+        act_fn: nn.Module | None = None, 
+        norm_fn: Literal['batch','layer'] | None = None, 
+        end_fn: bool | nn.Module = False,
 
         # kwargs
-        mlp_kwargs:dict=None,
-        pooling_kwargs:dict=None,
+        mlp_kwargs: dict | None = None,
+        pooling_kwargs: dict | None = None,
         *args, **kwargs
     ):
         super().__init__(*args, **kwargs)
@@ -277,6 +241,7 @@ class Latent(nn.Module):
             obj=pooling_class,
             base_class=SetPooling,
             builder = lambda cls: cls(
+                dims=dims,
                 mask=torch.ones(self.n_dim,1),
                 num_features=self.embed_dim,
                 hidden_dims=hidden_dims,
@@ -318,45 +283,43 @@ class Latent(nn.Module):
 
         return data
 
-## Classifiers
-
 @cloneable
-class LatentClassifier(nn.Module):
+class BaseModel(nn.Module):
     def __init__(
         self,
-        dataset:GraphDataset, # dims
-        embed_dim:int=None, # dims
-        head_dim:int=None,  # dims
-        num_heads:int=1,  # dims
-        method:Literal['node','set']='node', # dims, encoder; twin removed for now
+        dataset: GraphDataset, # dims
+        out_dim: int, # output
+        embed_dim: int | None = None, # dims
+        head_dim: int | None = None,  # dims
+        num_heads: int = 1,  # dims
+        method: Literal['node','set'] = 'node', # dims, encoder; twin removed for now
 
         # layers
-        norm_class:Normalizer=None, # encoder
-        encoder_class:nn.Module=None, # encoder
-        pooling_class:SetPooling=SetPooling, # encoder, latent
-        mlp:Union[bool,nn.Module]=False, # latent
-        classifier:nn.Module=nn.Linear, # classifier
+        norm_class: Normalizer | None = None, # encoder
+        encoder_class: nn.Module | type[nn.Module] | None = None, # encoder
+        pooling_class: SetPooling | type[SetPooling] = SetPooling, # encoder, latent
+        mlp: bool | nn.Module = False, # latent
+        out_module: nn.Module | type[nn.Module] = nn.Linear, # output
 
         # new layer params
-        hidden_dims:list[int]=None, 
-        act_fn:nn.Module=None, 
-        norm_fn:Literal['batch','layer']=None, 
-        end_fn:Union[bool,nn.Module]=False,
+        hidden_dims: int | list[int] | None = None, 
+        act_fn: nn.Module | None = None, 
+        norm_fn: Literal['batch','layer'] | None = None, 
+        end_fn: bool | nn.Module = False,
 
         # kwargs
-        norm_kwargs:dict=None, # encoder
-        encoder_kwargs:dict=None, # encoder
-        pooling_kwargs:dict=None, # encoder, latent
-        mlp_kwargs:dict=None, # latent
-        classifier_kwargs:dict=None, # classifier
-        *args, **kwargs
+        norm_kwargs: dict | None = None, # encoder
+        encoder_kwargs: dict | None = None, # encoder
+        pooling_kwargs: dict | None = None, # encoder, latent
+        mlp_kwargs: dict | None = None, # latent
+        out_kwargs: dict | None = None, # output
     ):
-        super().__init__(*args, **kwargs)
+        super().__init__()
         norm_kwargs = {} if norm_kwargs is None else norm_kwargs
         encoder_kwargs = {} if encoder_kwargs is None else encoder_kwargs
         pooling_kwargs = {} if pooling_kwargs is None else pooling_kwargs
         mlp_kwargs = {} if mlp_kwargs is None else mlp_kwargs
-        classifier_kwargs = {} if classifier_kwargs is None else classifier_kwargs
+        out_kwargs = {} if out_kwargs is None else out_kwargs
 
         # get dims
         self.dims = Dims(
@@ -366,36 +329,36 @@ class LatentClassifier(nn.Module):
         )
 
         # build hidden_dims from Dims
-        hidden_dims = build_hidden_dims(self.dims.embed_dim, hidden_dims)
+        self.hidden_dims = build_hidden_dims(self.dims.embed_dim, hidden_dims)
 
         # build model
         self.encoder = Encoder(
             dims=self.dims, method=method,
             norm_class=norm_class, encoder_class=encoder_class, pooling_class=pooling_class,
-            hidden_dims=hidden_dims, act_fn=act_fn, norm_fn=norm_fn, end_fn=end_fn,
+            hidden_dims=self.hidden_dims, act_fn=act_fn, norm_fn=norm_fn, end_fn=end_fn,
             norm_kwargs=norm_kwargs, encoder_kwargs=encoder_kwargs, pooling_kwargs=pooling_kwargs
         )
 
         self.latent = Latent(
             dims=self.dims,
             mlp=mlp, pooling_class=pooling_class,
-            hidden_dims=hidden_dims, act_fn=act_fn, norm_fn=norm_fn, end_fn=end_fn,
+            hidden_dims=self.hidden_dims, act_fn=act_fn, norm_fn=norm_fn, end_fn=end_fn,
             mlp_kwargs=mlp_kwargs, pooling_kwargs=pooling_kwargs
         )
 
-        self.classifier = clone_or_init(
-            name='classifier',
-            obj=classifier,
+        self.out_layer = clone_or_init(
+            name='out_layer',
+            obj=out_module,
             base_class=nn.Module,
-            builder=lambda cls: Sequential(
+            builder=lambda out_class: Sequential(
                 in_channels=self.dims.embed_dim,
-                out_channels=self.dims.num_classes,
-                layer_class=cls,
-                hidden_dims=hidden_dims,
+                out_channels=out_dim,
+                layer_class=out_class,
+                hidden_dims=self.hidden_dims,
                 act_fn=act_fn,
                 norm_fn=norm_fn,
                 end_fn=False, # no final layer, output raw logits
-                layer_kwargs=classifier_kwargs,
+                layer_kwargs=out_kwargs,
             )
         )
 
@@ -403,34 +366,129 @@ class LatentClassifier(nn.Module):
         if callable(getattr(self.encoder.norm, 'init_with_loader', None)):
             self.encoder.norm.init_with_loader(loader)
 
-    def _get_logits(self, data:dict, need_weights:bool):
-        # classify
-        cls_out = self.classifier(data, return_dict=need_weights, return_attention_weights=need_weights)
-
-        # extract logits from output
-        if isinstance(cls_out, Tensor):
-            logits = cls_out
-        else:
-            cls_out = input_to_dict(cls_out)
-            logits = cls_out.pop('x')
-
-        # can return cls_out if not nn.Linear; change in forward()
-        return logits 
-
     def forward(self, input:Union[Data, Tensor, dict], need_weights:bool=False):
         # get latent embedding
         data = self.encoder(input, need_weights)
         data = self.latent(data, need_weights)
+
+        # get output
+        out = self.out_layer(data, return_dict=need_weights, return_attention_weights=need_weights)
+
+        # extract x from output
+        if isinstance(out, Tensor):
+            x = out
+            out = None
+        else:
+            out = input_to_dict(out)
+            x = out.pop('x')
+
+        # pass to child class via super.forward()
+        return x, out, data
+
+## Models
+
+@cloneable
+class BaseClassifier(BaseModel):
+    def __init__(
+        self,
+        dataset: GraphDataset, # dims
+        out_dim: int | None = None, # output
+        embed_dim: int | None = None, # dims
+        head_dim: int | None = None,  # dims
+        num_heads: int = 1,  # dims
+        method: Literal['node','set'] = 'node', # dims, encoder; twin removed for now
+
+        # layers
+        norm_class: Normalizer | None = None, # encoder
+        encoder_class: nn.Module | type[nn.Module] | None = None, # encoder
+        pooling_class: SetPooling | type[SetPooling] = SetPooling, # encoder, latent
+        mlp: bool | nn.Module = False, # latent
+        out_module: nn.Module | type[nn.Module] = nn.Linear, # output
+
+        # new layer params
+        hidden_dims: int | list[int] | None = None, 
+        act_fn: nn.Module | None = None, 
+        norm_fn: Literal['batch','layer'] | None = None, 
+        end_fn: bool | nn.Module = False,
+
+        # kwargs
+        norm_kwargs: dict | None = None, # encoder
+        encoder_kwargs: dict | None = None, # encoder
+        pooling_kwargs: dict | None = None, # encoder, latent
+        mlp_kwargs: dict | None = None, # latent
+        out_kwargs: dict | None = None, # output
+    ):
+        # default: out_dim = num_classes (for classification)
+        out_dim = dataset.num_classes if out_dim is None else out_dim
+
+        # call init
+        super().__init__(
+            dataset, out_dim, embed_dim, head_dim, num_heads, method,
+            norm_class, encoder_class, pooling_class, mlp, out_module,
+            hidden_dims, act_fn, norm_fn, end_fn,
+            norm_kwargs, encoder_kwargs, pooling_kwargs, mlp_kwargs, out_kwargs
+        )
+
+    def forward(self, input:Union[Data, Tensor, dict], need_weights:bool=False):
+        x, out, data = super().forward(input, need_weights)
         
-        # get logits
-        logits = self._get_logits(data, need_weights)
-
         # format output
-        del data['x']
-        data['y_logits'] = logits
-        data['y_probs'] = logits.softmax(dim=-1)
-        data['y_preds'] = logits.argmax(dim=-1)
-
+        del data['x'] # avoid overlap with batch dict
+        data['y_logits'] = x
+        data['y_probs'] = x.softmax(dim=-1)
+        data['y_preds'] = x.argmax(dim=-1)
+        if need_weights:
+            data['layer_outs']['clf'] = out
         return data
 
-##
+@cloneable
+class BaseAutoencoder(BaseModel):
+    def __init__(
+        self,
+        dataset: GraphDataset, # dims
+        out_dim: int | None = None, # output
+        embed_dim: int | None = None, # dims
+        head_dim: int | None = None,  # dims
+        num_heads: int = 1,  # dims
+        method: Literal['node','set'] = 'node', # dims, encoder; twin removed for now
+
+        # layers
+        norm_class: Normalizer | None = None, # encoder
+        encoder_class: nn.Module | type[nn.Module] | None = None, # encoder
+        pooling_class: SetPooling | type[SetPooling] = SetPooling, # encoder, latent
+        mlp: bool | nn.Module = False, # latent
+        out_module: nn.Module | type[nn.Module] = nn.Linear, # output
+
+        # new layer params
+        hidden_dims: int | list[int] | None = None, 
+        act_fn: nn.Module | None = None, 
+        norm_fn: Literal['batch','layer'] | None = None, 
+        end_fn: bool | nn.Module = False,
+
+        # kwargs
+        norm_kwargs: dict | None = None, # encoder
+        encoder_kwargs: dict | None = None, # encoder
+        pooling_kwargs: dict | None = None, # encoder, latent
+        mlp_kwargs: dict | None = None, # latent
+        out_kwargs: dict | None = None, # output
+    ):
+        # default: out_dim = num_classes (for classification)
+        out_dim = dataset[0].num_nodes if out_dim is None else out_dim
+
+        # call init
+        super().__init__(
+            dataset, out_dim, embed_dim, head_dim, num_heads, method,
+            norm_class, encoder_class, pooling_class, mlp, out_module,
+            hidden_dims, act_fn, norm_fn, end_fn,
+            norm_kwargs, encoder_kwargs, pooling_kwargs, mlp_kwargs, out_kwargs
+        )
+
+    def forward(self, input:Union[Data, Tensor, dict], need_weights:bool=False):
+        x, out, data = super().forward(input, need_weights)
+        
+        # format output
+        del data['x'] # avoid overlap with batch dict
+        data['x_preds'] = x.view(self.encoder.orig_shape)
+        if need_weights:
+            data['layer_outs']['dec'] = out
+        return data

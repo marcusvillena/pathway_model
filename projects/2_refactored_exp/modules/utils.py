@@ -8,11 +8,18 @@ import subprocess
 import numpy as np
 import pandas as pd
 
+import math # stringify
+import numbers # stringify
+import re # clean_name
+import unicodedata # clean_name
+import hashlib # clean_name
+
 # typing
 from torch import Tensor
 from torch_geometric.data import Batch, Data
 from typing import Callable, Literal, Optional, Type, Union
 
+# math
 def tsoftmax(input:Tensor, temperature:float=1, dim:int=None, dtype:Optional[torch.dtype]=None):
     if temperature is None:
         temperature = 1
@@ -22,60 +29,232 @@ def tsoftmax(input:Tensor, temperature:float=1, dim:int=None, dtype:Optional[tor
     return torch.softmax(input / temperature, dim=dim)
 
 # general
-def vprint(*objects, verbose=True, **kwargs):
-    if verbose==True:
-        print(*objects, **kwargs)
+def stringify(x) -> str:
+    # None, str, int, bool: as is
+    if x is None:
+        return 'None'
+    if isinstance(x, str):
+        return x
+    if isinstance(x, (int,bool)):
+        return str(x) # bool as 'True' or 'False'
 
-def dict_summary(_dict:dict, width:int=24):
-    # init str
-    out = ''
+    # float: sci not.
+    if isinstance(x, numbers.Real):
+        # float inf, -inf, nan
+        if math.isinf(x) or math.isnan(x):
+            return str(x)
+        
+        # sci not
+        sci = f'{x:.2e}'
+        mantissa, exp = sci.split('e')
 
-    for key, value in _dict.items():
-        # get variable shape
-        if type(value) == pd.DataFrame:
-            shape = value.shape
-        elif type(value) in [torch.Tensor, np.ndarray]:
-            shape = tuple([i for i in value.shape])
-        elif type(value) in [list, dict]:
-            shape = len(value)
-        elif type(value) in [int, str, bool]:
-            shape = value
-        elif type(value) == float:
-            shape = f'{value:.4f}'
-        else:
-            shape = None
+        # short floats as reg
+        if abs(float(exp)) < 3:
+            return f'{x:.3g}'
 
-        # append shape if applicable
-        if shape != None:
-            try:
-                out += f'# {key:<{width}} {str(shape):<{width}} {type(value).__name__} ({value.device.__str__()})\n'
-            except:
-                out +=  f'# {key:<{width}} {str(shape):<{width}} {type(value).__name__}\n'
-        else:
-            out += f'# {key:<{width}} {type(value).__name__}\n'
-
-    return out
-
-# training
-def clean_name(name): # for t.grid()
-    # convert to str
-    if isinstance(name,float):
-        name = f'{name:.5e}' # sci not.
-        name = name.replace('e-0','e-')
-        name = name.replace('e+0','e')
-        mantissa, exp = name.split('e')
+        # long floats as formatted sci not.
+        exp = exp.replace('-0','-')
+        exp = exp.replace('+0','')
         mantissa = mantissa.rstrip('0').rstrip('.')
-        name = f'{mantissa}e{exp}'
-    if isinstance(name, str):
-        name.capitalize()
-    else:
-        name = f'{name}'
+        return f'{mantissa}e{exp}'
 
-    # clean str
-    name = name.replace('.','p')
-    name = name.replace('_','')
+    # type, callable: name or class name
+    if isinstance(x, type) or callable(x):
+        return getattr(x, "__name__", x.__class__.__name__)
+
+    # containers: recursive
+    if isinstance(x, list):
+        return '[' + ','.join(stringify(i) for i in x) + ']'
     
+    if isinstance(x, tuple):
+        return '(' + ','.join(stringify(i) for i in x) + ')'
+    
+    if isinstance(x, set):
+        # sort values compared as repr/str (deterministic), 
+        items = sorted(x, key=lambda v: repr(v))
+        return '{' + ','.join(stringify(i) for i in items) + '}'
+    
+    # dict: recursive
+    if isinstance(x, dict):
+        # sort (key,value) pairs by key compared as repr/str (deterministic), 
+        items = sorted(x.items(), key=lambda kv: repr(kv[0]))
+        return '{' + ','.join(stringify(k) + ':' + stringify(v) for k,v in items) + '}'
+
+    # fallback, class name or force str
+    try:
+        return x.__class__.__name__
+    except Exception:
+        return str(x)
+    
+def clean_name(x, max_len:int=80) -> str:
+    """
+    Turn arbitrary Python object x into a filesystem-safe name
+    for use as a single file or folder name on Linux, macOS, and Windows.
+    """
+    # stringify
+    name = stringify(x)
+
+    # normalize unicode (helps on macOS, etc.)
+    name = unicodedata.normalize("NFKD", name)
+
+    # remove path separators (just in case)
+    name = name.replace("/", "_").replace("\\", "_")
+
+    # collapse whitespace to single underscores
+    name = re.sub(r"\s+", "_", name)
+
+    # remove characters invalid on Windows:  < > : " / \ | ? *
+    # (keep only: letters, digits, dash, underscore, dot, plus)
+    name = re.sub(r"[^A-Za-z0-9._+-]", "_", name)
+
+    # collapse multiple underscores, dots
+    name = re.sub(r"_+", "_", name)
+    name = re.sub(r"\.{2,}", ".", name)
+
+    # trim leading/trailing spaces, dots, underscores
+    name = name.strip(" ._")
+
+    # avoid empty names
+    if not name:
+        name = "unnamed"
+
+    # avoid Windows reserved device names (case-insensitive)
+    upper = name.upper()
+    windows_reserved_names = {
+        "CON", "PRN", "AUX", "NUL",
+        *(f"COM{i}" for i in range(1, 10)),
+        *(f"LPT{i}" for i in range(1, 10)),
+    }
+    if upper in windows_reserved_names or name in {".", ".."}:
+        name = name + "_"
+
+    # truncate long names but keep a short hash suffix for uniqueness
+    if len(name) > max_len:
+        # generate hash suffix
+        digest = hashlib.sha1(name.encode("utf-8")).hexdigest()[:8]
+
+        # room for '_' + hash
+        keep = max_len - 1 - len(digest)
+
+        # extreme case: max_len very small, use digest only, up to max len
+        if keep < 1:
+            name = digest[:max_len]
+
+        # otherwise, append digest suffix to name
+        else:
+            name = name[:keep] + "_" + digest
+
     return name
+
+def get_name_recursive(obj):
+    # type, callable, get __name__
+    if isinstance(obj, type) or callable(obj):
+        return getattr(obj, "__name__", obj.__class__.__name__)
+    
+    # dict, recurse through vals
+    if isinstance(obj, dict):
+        return {k: get_name_recursive(v) for k, v in obj.items()}
+    
+    # container, recurse
+    if isinstance(obj, (list,tuple,set)):
+        t = type(obj)
+        return t(get_name_recursive(x) for x in obj)
+    
+    # keep real values for primitives
+    if isinstance(obj, (str,int,bool,float)) or (obj is None):
+        return obj
+    
+    # instances
+    if isinstance(type(obj), type):
+        return obj.__class__.__name__
+    
+    # fallback
+    return stringify(obj)
+
+# viz, pandas
+def filter_df(df, filters={}):
+    mask = pd.Series(True, index=df.index)
+
+    for col, rule in filters.items():
+        if callable(rule):
+            mask &= rule(df[col])        # custom lambda
+        elif isinstance(rule, (list, tuple, set)):
+            mask &= df[col].isin(rule)
+        else:
+            mask &= (df[col] == rule)
+
+    return df[mask]
+
+def merge_devtest_csvs(folder, subfolders:list[str], file:str, save:bool=False):
+    '''
+    merges csvs with the same name in separate subfolders, with option to save to main folder
+    useful for experiment main folder, and manually combining trials across subfolders.
+
+    example structure:
+
+    folder (e.g. experiment)
+        subfolder1
+            dev.csv
+            test.csv
+        subfolder2
+            dev.csv
+            test.csv
+        subfolder3
+            (etc.)
+
+    folder should be str or Path
+    subfolder is list of str
+    file should be str
+
+    '''
+    trial_dfs = []
+    old_max = -1 # start at -1+1=0
+
+    for subfolder in subfolders:
+        # read data
+        trial_df = pd.read_csv(folder / subfolder / file)
+
+        # safety, if file does not exist
+        if trial_df.empty:
+            continue
+
+        # get new minimum (of current trial)
+        new_min = trial_df['trial'].min()
+
+        # calculate shift
+        shift = (old_max+1) - new_min
+
+        # shift trial to start after old max
+        trial_df['trial'] += shift
+
+        # append to list
+        trial_dfs.append(trial_df)
+
+        # get maximum of current trial for next (old_max)
+        old_max = trial_df['trial'].max()
+
+    df = pd.concat(trial_dfs, ignore_index=True)
+
+    if save:
+        df.to_csv(folder / file, index=False)
+
+    return df
+
+def validate_filter(values, all_values:list, name:str):
+    # return all_values if None
+    if values is None:
+        return all_values
+
+    # ensure values is list
+    if not isinstance(values, list):
+        values = [values]
+
+    # check for filter vals missing in all vals
+    missing = [x for x in values if x not in all_values]
+    if missing:
+        raise ValueError(f'Unknown {name}(s): {missing}')
+    
+    return values
 
 # models
 def build_hidden_dims(embed_dim:int, hidden_dims:Union[int, list[int], None]) -> Optional[list[int]]:
@@ -111,71 +290,22 @@ def clone_or_init(
       f"{name} must be a {base_class.__name__} instance or subclass, got {type(obj)}"
    )   
 
-def input_to_dict(input):
-    if isinstance(input, Tensor): # x (Tensor) only
-        data = {'x':input}
-    elif isinstance(input, Data): # PyG Data or DataBatch
-        data = {key: getattr(input, key) for key in input.keys()}
-    elif isinstance(input, dict): # predefined dict
-        data = input
+def input_to_dict(x, name:str='x'):
+    # already dict
+    if isinstance(x, dict):
+        return x
+    
+    # x (Tensor) only
+    elif isinstance(x, Tensor): 
+        return {name:x}
+
+    # PyG Data or DataBatch
+    elif isinstance(x, (Data, Batch)): 
+        return dict(x)
+
+    # error case
     else:
-        raise TypeError(f'unsupported input type: {type(input)}')
-    return data
-
-def reshape(x:Union[Tensor, Batch], to:Literal['b,n,f','b*n,f','b,n*f'], batch_size:Optional[int]=None, num_nodes:Optional[int]=None, num_features:Optional[int]=None, return_dims:bool=False):
-    '''
-    detects x of size (b,n,f), (b*n,f), or (b,n*f) and returns desired view
-    '''
-    # if batch
-    if hasattr(x, 'x'):
-        batch_size = x.batch_size
-        num_features = x.num_node_features
-        x = x.x
-        
-    # ensure supported dim
-    assert x.dim() in (2,3), f'unsupported x.dim(): {x.dim()}'
-
-    # b,n,f all known
-    if (batch_size is not None) and (num_nodes is not None) and (num_features is not None):
-        pass # do nothing
-    elif x.dim() == 3:
-        batch_size, num_nodes, num_features = x.shape
-
-    # one unknown (dim = 2)
-    else:
-        # find num_nodes
-        if (batch_size is not None) and (num_features is not None):
-            if x.shape[-1] == num_features: # b*n,f case
-                num_nodes = int(x.shape[0]//batch_size)
-            else: # b,n*f case
-                num_nodes = int(x.shape[-1]//num_features)
-
-        # find batch_size
-        elif (num_nodes is not None) and (num_features is not None):
-            if x.shape[-1] == num_features: # b*n,f case
-                batch_size = int(x.shape[0]//num_nodes)
-            else: # b,n*f case
-                batch_size = x.shape[0]
-
-        # find num_features
-        elif (batch_size is not None) and (num_nodes is not None):
-            if x.shape[0] == batch_size: # b,n*f case
-                num_features = int(x.shape[-1]//num_nodes)
-            else: # b*n,f case
-                num_nodes = x.shape[-1]
-
-        # not enough information
-        assert sum(p is not None for p in [batch_size, num_nodes, num_features]) >= 2, 'two of [batch_size, num_nodes, num_features] must be provided'
-
-    # reshape
-    if to == 'b,n,f':
-        x = x.reshape(batch_size, num_nodes, num_features)
-    elif to == 'b*n,f':
-        x = x.reshape(batch_size * num_nodes, num_features)
-    else: # 'b,n*f
-        x = x.reshape(batch_size, num_nodes * num_features)
-
-    return (x, batch_size, num_nodes, num_features) if return_dims else x
+        raise TypeError(f'unsupported input type: {type(x)}')
 
 def filter_kwargs(func):
     '''
@@ -415,6 +545,40 @@ def attn_dims(embed_dim:Optional[int]=None, head_dim:Optional[int]=None, num_hea
     return embed_dim, head_dim, num_heads
 
 # data
+def vprint(*objects, verbose:bool=True, **kwargs):
+    if verbose:
+        print(*objects, **kwargs)
+
+def dict_summary(_dict:dict, width:int=24):
+    # init str
+    out = ''
+
+    for key, value in _dict.items():
+        # get variable shape
+        if type(value) == pd.DataFrame:
+            shape = value.shape
+        elif type(value) in [torch.Tensor, np.ndarray]:
+            shape = tuple([i for i in value.shape])
+        elif type(value) in [list, dict]:
+            shape = len(value)
+        elif type(value) in [int, str, bool]:
+            shape = value
+        elif type(value) == float:
+            shape = f'{value:.4f}'
+        else:
+            shape = None
+
+        # append shape if applicable
+        if shape != None:
+            try:
+                out += f'# {key:<{width}} {str(shape):<{width}} {type(value).__name__} ({value.device.__str__()})\n'
+            except:
+                out +=  f'# {key:<{width}} {str(shape):<{width}} {type(value).__name__}\n'
+        else:
+            out += f'# {key:<{width}} {type(value).__name__}\n'
+
+    return out
+
 class Devices():
     def __init__(self, verbose:bool=True):
         self.verbose = verbose

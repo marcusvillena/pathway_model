@@ -1,8 +1,71 @@
 import torch
 import torch.nn as nn
 
+from .utils import filter_kwargs, input_to_dict
 from torch import Tensor
-from typing import Literal
+from typing import Any, Literal
+
+class LossWrapper(nn.Module):
+    def __init__(
+        self, 
+        loss_fn:nn.Module, 
+        pos_keys:str|list[str],
+        out_keys:str|list[str]|dict[str,str]|None = None,
+        batch_keys:str|list[str]|dict[str,str]|None = None
+    ):
+        '''
+        pos_keys: str or list[str] of key names (loss_key) passed to loss_fn
+        out_keys/batch_keys: dict[str,str] maps of {loss_arg_name: x_key}
+        str and list[str] will assumes loss_arg_name == x_key.
+        '''
+        super().__init__()
+        self.loss_fn = loss_fn
+        out_keys = {} if out_keys is None else out_keys
+        batch_keys = {} if batch_keys is None else batch_keys
+
+        # format pos_keys
+        self.pos_keys: list[str] = [pos_keys] if isinstance(pos_keys,str) else pos_keys
+
+        # format out_keys
+        if isinstance(out_keys, str):
+            out_keys = {out_keys:out_keys}
+        elif isinstance(out_keys, (list,tuple,set)):
+            out_keys = {i:i for i in out_keys}
+    
+        # format batch_keys
+        if isinstance(batch_keys, str):
+            batch_keys = {batch_keys:batch_keys}
+        elif isinstance(batch_keys, (list,tuple,set)):
+            batch_keys = {i:i for i in batch_keys}
+
+        # merge batch_keys, out_keys into extra_keys
+        self.extra_keys: dict[str,str] = {**out_keys, **batch_keys}
+
+        # safety checks
+        if not self.extra_keys:
+            raise ValueError("One of 'batch_keys' or 'out_keys' must be provided.")
+        missing_keys = [key for key in self.pos_keys if key not in self.extra_keys]
+        if missing_keys:
+            raise ValueError(f"All 'pos_keys' must be in one of 'batch_keys' or 'out_keys'. Missing {missing_keys}")
+
+    def forward(self, out:dict[str,Any], batch:dict[str,Any]):
+        # input to dict
+        out = input_to_dict(out)
+        batch = input_to_dict(batch)
+
+        # extract kwargs, return
+        values = {**out, **batch}
+        extra_kwargs = {key:values[value_key] for key,value_key in self.extra_keys.items()}
+
+        # get pos args
+        pos_args = []
+        for key in self.pos_keys:
+            try:
+                pos_args.append(extra_kwargs.pop(key))
+            except KeyError:
+                raise KeyError(f"pos_arg {key} not in extra_kwargs. Check pos_keys/batch_keys/out_keys.")
+
+        return filter_kwargs(self.loss_fn.forward)(*pos_args, **extra_kwargs)
 
 class NBLoss(nn.Module):
     def __init__(self, eps:float=1e-8, reduction:Literal['none', 'mean', 'sum']='mean', *args, **kwargs):

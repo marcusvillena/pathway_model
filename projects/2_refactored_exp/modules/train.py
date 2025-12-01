@@ -1,16 +1,18 @@
 # general
 import torch
 import torch.nn as nn
-from .utils import capture_kwargs, clean_name, filter_kwargs, input_to_dict, reshape
+from .utils import capture_kwargs, clean_name, get_name_recursive, filter_kwargs, input_to_dict
 
 # loader
 from torch.utils.data import random_split
 from torch_geometric.loader import DataLoader
 
 # trainer
+from .loss import LossWrapper
 from tqdm.auto import tqdm
 import copy
 import inspect
+import time
 import torch.optim as optim
 
 # experiment
@@ -24,18 +26,38 @@ import numpy as np
 # grid 
 import itertools
 
-# trainer metrics
-from torchmetrics.functional.classification import accuracy, precision, recall, f1_score, auroc
-
 # typing
 from .data import DataWrapper
-from torch import Generator, Tensor
-from typing import Literal, Optional, Sequence, Union
+from torch import  Tensor
+from torch_geometric.data import Data, Batch
+from typing import Literal, Sequence, Union
 
-## Main
+class LoaderStats():
+    def __init__(self, num_nodes:int, num_features:int, eps:float=1e-8):
+        # dims
+        self.num_nodes = num_nodes
+        self.num_features = num_features
+        self.eps = eps
 
+        # trackers, (n,f)
+        self.sum_x = torch.zeros(self.num_nodes, self.num_features)
+        self.sum_x2 = torch.zeros(self.num_nodes, self.num_features)
+
+    def update(self, x:Tensor):
+        # update sums, (n,f)
+        self.sum_x += x.sum(dim=0)
+        self.sum_x2 += (x**2).sum(dim=0)
+
+    def compute(self, count:int):
+        # compute mean, var, std in (n,f)
+        mean = self.sum_x / count
+        var = torch.clamp((self.sum_x2/count) - (mean.pow(2)), min=0.0)
+        std = torch.clamp(torch.sqrt(var), min=self.eps)
+
+        return mean, var, std
+    
 class Loader():
-    def __init__(self, dataset:DataWrapper, device:str, batch_size:int=16, val_size:int=0.15, test_size:int=0.15, stats_kwargs:dict=None):
+    def __init__(self, dataset:DataWrapper, device:str, batch_size:int=16, val_size:int=0.15, test_size:int=0.15, eps:float=1e-8, stats_kwargs:dict=None):
         # init seed, generator
         self.seed = torch.seed()
         generator = torch.Generator(device=device).manual_seed(self.seed)
@@ -56,122 +78,182 @@ class Loader():
         self.val_loader = DataLoader(val_dataset, batch_size=batch_size, shuffle=False, generator=generator)
         self.test_loader = DataLoader(test_dataset, batch_size=batch_size, shuffle=False, generator=generator)
 
+        # get dims
+        self.eps = eps if isinstance(eps, float) else 1e-8
+        self.num_nodes = self.dataset[0].num_nodes
+        self.num_features = self.dataset[0].num_features
+        self.num_classes = self.dataset.num_classes
+
         # get stats
         stats_kwargs = {} if stats_kwargs is None else stats_kwargs
         self.stats = self.get_stats(loader=self.train_loader, **stats_kwargs)
 
-    def get_stats(self, loader:DataLoader, target_class:Optional[Union[int, Sequence[int]]]=None):
-        # dims
-        num_nodes = self.dataset[0].num_nodes
-        num_features = self.dataset[0].num_features
-        num_classes = self.dataset.num_classes
+    def _get_theta(self, mean:Tensor, var:Tensor, theta_lambda:float=0.5, theta_min:float=1e-6, theta_max:float=1e6):
+        # compute theta from mean, var (method of moments)
+        theta = mean.pow(2) / torch.clamp(var - mean, min=self.eps)  # avoid div0
 
+        # mask finite values
+        mask = torch.isfinite(theta) & (theta > 0)
+
+        # get global theta (median of finite thetas)
+        theta_global = torch.median(theta[mask]) if mask.any() else theta.new_tensor(1.0)
+
+        # smooth with global and clamp
+        theta = (1-theta_lambda) * theta + theta_lambda * theta_global
+        theta = torch.clamp(theta, min=theta_min, max=theta_max)  
+
+        return theta
+
+    def _filter_batch(self, batch, target_class:int|Sequence[int]|None):
+        data = input_to_dict(batch)
+        x = data['x'].reshape(-1, self.num_nodes, self.num_features) # (b,n,f)
+        y = data['y']  # (b,)
+
+        # skip filtering if no target class
+        if target_class is None:
+            return x, y
+        
+        # apply class filtering if applicable, mask in (b,)
+        mask = torch.isin(y, target_class.to(device=y.device, dtype=y.dtype))
+
+        # return None if no samples; skips in loop 
+        if not mask.any():
+            return None, y  
+        
+        # filter x, y remains unfiltered
+        x = x[mask]
+
+        return x, y
+
+    def get_stats(self, loader:DataLoader, target_class:int|Sequence[int]|None=None):
         # init trackers
-        sum_x = torch.zeros(num_nodes, num_features)
-        sum_x2 = torch.zeros(num_nodes, num_features)
-        sum_logx = torch.zeros(num_nodes, num_features)
-        sum_logx2 = torch.zeros(num_nodes, num_features)
+        raw_stats = LoaderStats(self.num_nodes, self.num_features, eps=self.eps)
+        log_stats = LoaderStats(self.num_nodes, self.num_features, eps=self.eps)
+        class_counts = torch.zeros(self.num_classes, dtype=torch.long)
         count = 0
-        class_counts = torch.zeros(num_classes, dtype=torch.long)
-
-
+        
         # ensure target_class is list -> tensor
-        if isinstance(target_class, int): # if int (one class)
-            target_class = torch.tensor([target_class])
-        elif target_class is not None: # if iterable (multiclass)
-            target_class = torch.tensor(list(target_class))
+        if target_class is not None:
+            target_class = torch.as_tensor(target_class)
 
         # compute for all batches in loader
         for batch in loader:
-            data = input_to_dict(batch)
-            x = reshape(data['x'], 'b,n,f', num_nodes=num_nodes, num_features=num_features) # (b,n,f)
-            y = data['y']  # (b,)
+            x,y = self._filter_batch(batch, target_class)
 
-            # apply class filtering if applicable
-            if target_class is not None:
-                mask = torch.isin(y, target_class)
-                if not mask.any():
-                    continue
-                x = x[mask]
-
-            # skip batch if empty (avoid div0)
-            if x.size(0) == 0:
-                continue
-            
-            # get log
-            log_x = torch.log1p(x)
-
-            # add to running
-            sum_x += x.sum(dim=0) # (n,f)
-            sum_x2 += (x**2).sum(dim=0) # (n,f)
-            sum_logx += log_x.sum(dim=0) # (n,f)
-            sum_logx2 += (log_x**2).sum(dim=0) # (n,f)
-            count += x.size(0)
+            # update class counts, regardless of filtering
             class_counts += torch.bincount(y, minlength=class_counts.numel())
 
-        # ensure samples present (avoid div0)
-        if count == 0:
+            # skip if no samples for target class post-filtering
+            if x is None:
+                continue 
+
+            # log transform
+            log_x = torch.log1p(x)
+
+            # update
+            raw_stats.update(x)
+            log_stats.update(log_x)
+            count += x.size(0)
+
+        # ensure samples present (avoid div0) 
+        if count == 0: 
             raise ValueError("No samples found for the specified class(es).")
 
-        # compute mean
-        mean = sum_x / count
-        log_mean = sum_logx / count
-        
-        # compute std
-        var = torch.clamp((sum_x2/count) - (mean.pow(2)), min=0.0)
-        log_var = torch.clamp((sum_logx2/count) - (log_mean.pow(2)), min=0.0)
+        # compute mean, var, std, theta in (n,f)
+        mean, var, std = raw_stats.compute(count)
+        log_mean, log_var, log_std = log_stats.compute(count)
+        theta = self._get_theta(mean, var)
 
-        std = torch.clamp(torch.sqrt(var), min=1e-8)
-        log_std = torch.clamp(torch.sqrt(log_var), min=1e-8)
+        # compute NBVST stats (2nd pass)
+        nb_stats = LoaderStats(self.num_nodes, self.num_features, eps=self.eps)
 
-        # add batch dim
-        mean = mean.unsqueeze(0)
-        std = std.unsqueeze(0)
-        log_mean = log_mean.unsqueeze(0)
-        log_std = log_std.unsqueeze(0)
+        for batch in loader:
+            x, _ = self._filter_batch(batch, target_class)
+            if x is None:
+                continue  # skip if no samples for target class
 
+            # NB anscombe transform
+            radicand = torch.clamp(theta * (x + 3.0/8.0), min=0.0)
+            x_nb = (2.0 / torch.sqrt(theta)) * torch.asinh(torch.sqrt(radicand + self.eps))
+
+            # update
+            nb_stats.update(x_nb)
+
+        # compute NBVST mean, var, std in (n,f)
+        nb_mean, nb_var, nb_std = nb_stats.compute(count)
+
+        # add batch dim, return (1,n,f)
         return {
-            'mean': mean,
-            'std': std,
-            'log_mean': log_mean,
-            'log_std': log_std,
+            'mean': mean.unsqueeze(0),
+            'std': std.unsqueeze(0),
+            'log_mean': log_mean.unsqueeze(0),
+            'log_std': log_std.unsqueeze(0),
+            'nb_mean': nb_mean.unsqueeze(0),
+            'nb_std': nb_std.unsqueeze(0),
+            'theta': theta.unsqueeze(0),
             'class_counts': class_counts
         }
 
 class Trainer():
     def __init__(
         self, 
-        lr:float, 
-        loss_class:type[nn.Module], 
-        loss_kwargs:dict|None = None, 
-        optim_class:type[optim.Optimizer] = optim.Adam, 
-        optim_kwargs:dict|None = None, 
-        report_metrics:list[str]|None = None,
-        **kwargs 
+        lr: float,
+        pos_keys: str | list[str],
+        out_keys: str | list[str] | dict[str,str] | None = None,
+        batch_keys: str | list[str] | dict[str,str] | None = None,
+        loss_class: type[nn.Module] | None = None,
+        loss_kwargs: dict | None = None,
+        optim_class: type[optim.Optimizer] = optim.Adam, 
+        optim_kwargs: dict | None = None,
+        **kwargs # pass child kwargs to capture_kwargs
     ):
+        # ensure loss_class is provided
+        if loss_class is None:
+            raise ValueError("'loss_class' must be provided.")
+        
+        # ensure one of (batch_keys, out_keys) is provided
+        if batch_keys is None and out_keys is None:
+            raise ValueError("One of 'batch_keys' or 'out_keys' must be provided.")
+        
         # get kwargs
         sig = inspect.signature(type(self).__init__)
-        self._orig_kwargs = capture_kwargs(sig, self, lr, loss_class, loss_kwargs, optim_class, optim_kwargs, report_metrics, **kwargs)
+        self._orig_kwargs = capture_kwargs(
+            sig, self, 
+            lr=lr, 
+            pos_keys=pos_keys, 
+            out_keys=out_keys, 
+            batch_keys=batch_keys, 
+            loss_class=loss_class, 
+            loss_kwargs=loss_kwargs, 
+            optim_class=optim_class, 
+            optim_kwargs=optim_kwargs, 
+            **kwargs
+        )
 
         # defaults
         self.lr = lr
+        self.pos_keys = pos_keys
+        self.out_keys = out_keys
+        self.batch_keys = batch_keys
         self.loss_class = loss_class
-        self.loss_kwargs = {} if loss_kwargs is None else loss_kwargs
+        self.loss_kwargs = {} if loss_kwargs is None else dict(loss_kwargs)
         self.optim_class = optim_class
-        self.optim_kwargs = {} if optim_kwargs is None else optim_kwargs
-        self.report_metrics = ['loss'] if report_metrics is None else report_metrics
+        self.optim_kwargs = {} if optim_kwargs is None else dict(optim_kwargs)
 
-    def run(self, model:nn.Module, loader:Loader, num_epochs:int, verbose:bool=False):
-        # get loader
-        self.loader = loader
+    def run(self, model:nn.Module, loader:Loader, num_epochs:int, report_metrics:str|list[str]|None=None, verbose:bool=False):
+        # defaults
+        if report_metrics is None:
+            report_metrics = ['loss']
+        elif isinstance(report_metrics, str):
+            report_metrics = [report_metrics]
 
-        # initiate loss
-        self.loss_fn = self._init_loss(self.loader)
+        # init trainer (self.loss_fn, self.norm, etc.)
+        self._init_with_loader(loader)
 
         # initiate model
         self.model = model.clone() if hasattr(model, 'clone') else copy.deepcopy(model)
         if hasattr(self.model, 'init_with_loader'):
-            self.model.init_with_loader(self.loader)
+            self.model.init_with_loader(loader)
 
         # init optimizer (requires model)
         self.optimizer = self.optim_class(self.model.parameters(), lr=self.lr, **self.optim_kwargs)        
@@ -179,30 +261,39 @@ class Trainer():
         # train, val loop
         self.dev_metrics = {}
 
+        # start timer
+        if torch.cuda.is_available(): torch.cuda.synchronize()
+        time_start = time.perf_counter()
+
         pbar = tqdm(range(num_epochs), leave=verbose)
         for epoch in pbar:
             # training
-            train_metrics, _ = self._run_phase('train', self.loader.train_loader)
+            train_metrics, _ = self._run_phase('train', loader.train_loader)
 
             # validating
-            val_metrics, _ = self._run_phase('eval', self.loader.val_loader)
+            val_metrics, _ = self._run_phase('eval', loader.val_loader)
 
             # record training/validation
             self.dev_metrics[epoch] = {'train': train_metrics, 'val': val_metrics}
 
             # get reports
-            train_report = self._generate_report(train_metrics, self.report_metrics)
-            val_report = self._generate_report(val_metrics, self.report_metrics)
+            train_report = self._generate_report(train_metrics, report_metrics)
+            val_report = self._generate_report(val_metrics, report_metrics)
 
             # update pbar with report
             epoch_report = f'Epoch {epoch+1}/{num_epochs}, Train: {train_report},    Val: {val_report}'
             pbar.set_postfix_str(epoch_report)
 
         # test
-        self.test_metrics, self.test_values = self._run_phase('eval', self.loader.test_loader)
+        self.test_metrics, self.test_values = self._run_phase('eval', loader.test_loader)
+
+        # end timer, append to metrics
+        if torch.cuda.is_available(): torch.cuda.synchronize()
+        time_end = time.perf_counter()
+        self.test_metrics['time'] = time_end - time_start
 
         # print test report
-        self.test_report = self._generate_report(self.test_metrics, self.report_metrics)
+        self.test_report = self._generate_report(self.test_metrics, report_metrics)
         if verbose:
             tqdm.write(f'Test\t {self.test_report}\n')
 
@@ -226,8 +317,7 @@ class Trainer():
             'batch_idx':0,
             'num_batches':len(dataloader),
             'loss':0,
-            'batch':[], # model input; used for custom metrics
-            'out':[] # model output; used for custom metrics
+            'data':[] # model input/output for custom metrics
         }
 
         # train mode
@@ -238,9 +328,7 @@ class Trainer():
                 loss, out = self._compute_loss(batch) 
                 loss.backward()
                 self.optimizer.step()
-                batch_log = self._update_batch_log(batch_log, loss, batch, out)
-
-            # self.batch_log = batch_log # debugging
+                batch_log = self._update_batch_log(batch_log, loss, out, batch)
 
         # eval mode
         else:
@@ -248,27 +336,34 @@ class Trainer():
             with torch.no_grad():
                 for batch in dataloader:
                     loss, out = self._compute_loss(batch)
-                    batch_log = self._update_batch_log(batch_log, loss, batch, out)
-
-            # self.batch_log = batch_log # debugging
+                    batch_log = self._update_batch_log(batch_log, loss, out, batch)
 
         # compute metrics
         metrics, values = self._compute_metrics(batch_log)
 
         return metrics, values
     
-    def _update_batch_log(self, batch_log:dict, loss:Tensor, batch:Union[Tensor,tuple], out:Union[Tensor,tuple]):
+    def _compute_loss(self, batch):     
+        out = self.model(batch)
+        loss = self.loss_fn(out, batch)
+        return loss, out
+    
+    def _update_batch_log(self, batch_log:dict, loss:Tensor, out:Union[Tensor,tuple], batch:Union[Tensor,tuple]):
         # increment batch, loss
         batch_log['batch_idx'] += 1
         batch_log['loss'] += loss.item()
 
         # detach batch (inputs), outputs
-        batch = self._detach_items(batch)
         out = self._detach_items(out)
+        batch = self._detach_items(batch)
 
-        # append batch, outputs
-        batch_log['batch'].append(batch)
-        batch_log['out'].append(out)
+        # convert to dict
+        out = input_to_dict(out, 'out')
+        batch = input_to_dict(batch, 'batch')
+
+        # merge and append
+        data = {**out, **batch}
+        batch_log['data'].append(data)
 
         return batch_log
     
@@ -277,54 +372,35 @@ class Trainer():
         if isinstance(item, Tensor):
             return item.detach()
 
-        # list/tuple of tensors
-        elif isinstance(item, (tuple, list)):
+        # list/tuple (recursive)
+        if isinstance(item, (list, tuple, set)):
             return type(item)(self._detach_items(i) for i in item)
 
-        # dict
-        elif isinstance(item, dict):
+        # dict, PyG Data/DataBatch
+        if isinstance(item, (dict, Data, Batch)):
             return {key: self._detach_items(value) for key, value in item.items()}
         
-        # PyG DataBatch or other class with .x
-        elif hasattr(item, 'x'):
-            out = {
+        # other class with .x
+        if hasattr(item, 'x'):
+            return {
                 'x': self._detach_items(item.x),
                 'y': self._detach_items(getattr(item, 'y', None)),
-                'batch_idx': self._detach_items(getattr(item, 'batch', None)),
-                'batch_size': self._detach_items(getattr(item, 'batch_size', None)),
+                'sample_id': self._detach_items(getattr(item, 'sample_id', None))
             }
-
-            return out
         
         # fallback
         return item
 
     #### change in child objects: ####
 
-    def _init_loss(self, loader:Loader):
-        return self.loss_class(**self.loss_kwargs)
-
-    def _compute_loss(self, batch): # change in child
-        # extract x,y if applicable
-        if isinstance(batch, (tuple,list)): # tuple, list
-            if len(batch) > 0:
-                x = batch[0]
-            if len(batch) > 1:
-                y = batch[1]
-        elif isinstance(batch, dict): # dict
-            x = batch.get('x', batch)
-            y = batch.get('y', x)
-        elif hasattr(batch, 'x'): # PyG DataBath or other class with .x
-            x = batch.x
-            y = getattr(batch, 'y', x)
-        
-        # get model output
-        out = self.model(x)
-
-        # compute loss
-        loss = self.loss_fn(out, y)
-
-        return loss, out
+    def _init_with_loader(self, loader:Loader|None=None):
+        # construct and wrap loss function
+        self.loss_fn = LossWrapper(
+            loss_fn = self.loss_class(**self.loss_kwargs),
+            pos_keys = self.pos_keys,
+            out_keys = self.out_keys,
+            batch_keys = self.batch_keys
+        )
     
     def _compute_metrics(self, batch_log:dict): # change in child
         # init
@@ -333,6 +409,10 @@ class Trainer():
 
         # compute metrics
         metrics['loss'] = batch_log['loss']/batch_log['num_batches']
+
+        # get values
+        sample_id = torch.cat([batch['sample_id'] for batch in batch_log['data']])
+        values = {'sample_id':sample_id}
 
         return metrics, values
 
@@ -360,21 +440,19 @@ class Experiment():
         self.configs = {}
 
     def add_config(self, name:str, model:nn.Module, trainer:Trainer):
-        # ensure name is string
-        name = str(name)
+        # clean name
+        name = clean_name(name)
 
         # generate unique name if duplicates
-        if name in self.configs:
+        base = name
+        candidate = name
+        i = 0
+        while candidate in self.configs:
+            candidate = f'{base}_{i}'
+            i += 1
 
-            # loop to find unique name
-            i = 0
-            candidate = f'{name}_{i}'
-
-            while candidate in self.configs:
-                i+=1
-                candidate = f'{name}_{i}'
-            
-            # print warning, set candidate as new name
+        # use updated name, with warning, if duplicate
+        if candidate != name:
             print(f'Warning: {name} already in configs, adding as {candidate}')
             name = candidate
             
@@ -382,7 +460,7 @@ class Experiment():
         self.models[name] = model
         self.configs[name] = trainer
 
-    def add_grid(self, model_grid:nn.Module|dict[str,nn.Module], trainer_grid:Trainer|dict[str,Trainer]):
+    def add_grid(self, model_grid:nn.Module|dict[str,nn.Module], trainer_grid:Trainer|dict[str,Trainer], prefix:str|None=None, suffix:str|None=None):
         # convert to dict if instance provided
         if isinstance(model_grid, nn.Module):
             model_grid = {'':model_grid}
@@ -394,23 +472,36 @@ class Experiment():
             for trainer_name, trainer in trainer_grid.items():
                 
                 # build name; fallback as 'config' if both == ''
-                name_parts = []
-                if model_name != '': name_parts.append(model_name) 
-                if trainer_name != '': name_parts.append(trainer_name)
-                name = '_'.join(name_parts) if name_parts else 'config'
+                parts = []
+                if model_name: 
+                    parts.append(clean_name(model_name))
+                if trainer_name: 
+                    parts.append(clean_name(trainer_name))
+                name = '_'.join(parts) if parts else 'config'
+
+                # add prefix, suffix
+                if prefix:
+                    name = f'{clean_name(prefix)}_{name}'
+                if suffix:
+                    name = f'{name}_{clean_name(suffix)}'
 
                 # add config
                 self.add_config(name, model, trainer)
 
-    def run_experiment(self, comment:str=None, save_csv:bool=False, save_params:bool=False, save_model:bool=False, verbose:bool=True, loader_kwargs:dict=None):
+    def run_experiment(self, comment:str=None, report_metrics:str|list[str]|None=None, save_csv:bool=False, save_params:bool=False, save_model:bool=False, save_values:bool=False, verbose:bool=True, loader_kwargs:dict=None):
         loader_kwargs = {} if loader_kwargs is None else loader_kwargs
+        if report_metrics is None:
+            report_metrics = ['loss']
+        elif isinstance(report_metrics, str):
+            report_metrics = [report_metrics]
 
         # make folder
-        self.folder = self._get_folder(comment) if True in (save_csv, save_params, save_model) else None
+        self.folder = self._get_folder(comment) if True in (save_csv, save_params, save_model, save_values) else None
  
         # init trackers
         dev_metrics = {}
         test_metrics = {}
+        test_values = {}
         seeds = []
 
         # trial loop
@@ -432,6 +523,7 @@ class Experiment():
             # add trial to trackers
             dev_metrics[trial] = {}
             test_metrics[trial] = {}
+            test_values[trial] = {}
             seeds.append(trial_loader.seed)
 
             # for each config
@@ -442,22 +534,34 @@ class Experiment():
                 config_pbar.set_postfix_str(report)
     
                 # run config with trial loader
-                config.run(model=self.models[config_name], loader=trial_loader, num_epochs=self.num_epochs)
+                config.run(model=self.models[config_name], loader=trial_loader, num_epochs=self.num_epochs, report_metrics=report_metrics)
 
                 # add trial config to trackers
                 dev_metrics[trial][config_name] = config.dev_metrics
                 test_metrics[trial][config_name] = config.test_metrics
+                test_values[trial][config_name] = config.test_values
 
-                # save
+                # create subfolder
                 if save_params or save_model:
                     subfolder = self.folder / f'{config_name}'
                     subfolder.mkdir(parents=True, exist_ok=True)
 
+                # save config params
                 if save_params:
-                    config_params = {'model': config.model._orig_kwargs, 'trainer': config._orig_kwargs}
-                    with open(subfolder / f'{config_name}_params.json', 'w') as f:
-                        json.dump(config_params, f, indent=4, default=str)
+                    # get path
+                    config_params_path = subfolder / f'{config_name}_params.json'
 
+                    # write if doesnt exist (avoid duplicates)
+                    if not config_params_path.exists():
+
+                        # get config params, clean names recursively
+                        config_params = {'model': config.model._orig_kwargs, 'trainer': config._orig_kwargs}
+                        config_params = get_name_recursive(config_params)
+
+                        with config_params_path.open('w') as f:
+                            json.dump(config_params, f, indent=4, default=str)
+
+                # save model
                 if save_model:
                     state_dict = config.model.state_dict()
                     torch.save(state_dict, subfolder / f'{config_name}_trial_{trial}_model.pth')
@@ -469,6 +573,7 @@ class Experiment():
             # save metrics, params per trial
             self.dev_df = self._format_outputs(dev_metrics, 'dev', save_csv)
             self.test_df = self._format_outputs(test_metrics, 'test', save_csv)
+            self.test_values = self._format_outputs(test_values, 'values', save_values)
             self._save_params(seeds, save_params)
         
         # get summary
@@ -491,9 +596,10 @@ class Experiment():
 
         return folder
     
-    def _format_outputs(self, x:dict, method:Literal['dev','test','values'], save_csv:bool=False):
-        if method in ['dev', 'test']:
-            # reshape rows
+    def _format_outputs(self, x:dict, method:Literal['dev','test','values'], save:bool=False):
+        if method in ('dev', 'test'):
+
+            # format rows
             if method == 'dev':
                 rows = [
                     {
@@ -510,7 +616,6 @@ class Experiment():
                     for stage, metrics in stages.items()
                     for metric, value in metrics.items()
                 ]
-
             elif method == 'test':
                 rows = [
                     {
@@ -528,7 +633,7 @@ class Experiment():
             df = pd.DataFrame(rows)
 
             # save csv
-            if save_csv:
+            if save:
                 df.to_csv(self.folder / f'{method}.csv', index=False)
 
             return df
@@ -536,20 +641,33 @@ class Experiment():
         elif method == 'values':
             out = {}
 
-            for trial, configs in x.items():
-                for config_name, _variables in configs.items():
-                    for _variable, value in _variables.items():
-                        # initialize config dict if not already made
-                        if _variable not in out:
-                            out[_variable] = {}
+            # restructure dict
+            for trial, configs in x.items():        
+                for config, names in configs.items():
+                    for name, value in names.items():
 
-                        # initialize var list if not already made
-                        if config_name not in out[_variable]:
-                            out[_variable][config_name] = []
+                        # initialize config dict
+                        if config not in out:
+                            out[config] = {}
+
+                        # initialize value list
+                        if name not in out[config]:
+                            out[config][name] = []
 
                         # append value to list
-                        out[_variable][config_name].append(value)
-            
+                        out[config][name].append(value)
+
+            # save
+            if save:
+                # stack arrays, flatten
+                flat = {}
+                for config, names in out.items():
+                    for name, values in names.items():
+                        flat[f'{config}/{name}'] = np.stack(values, axis=0)
+                
+                # save to .npz
+                np.savez_compressed(self.folder/f'values.npz', **flat)
+
             return out
 
     def _get_summary(self, df:pd.DataFrame, save_csv:bool=False):
@@ -563,7 +681,7 @@ class Experiment():
                 return ci
 
             # group df, get summary stats
-            summary_df = df.groupby(['config','metric'])['value'].agg(mean='mean', std='std', ci=_get_ci).reset_index()
+            summary_df = df.groupby(['config','metric'])['value'].agg(mean='mean', sd='std', ci=_get_ci).reset_index()
 
         # 1 trial only, std and ci can't be calculated
         else:
@@ -595,15 +713,17 @@ class Experiment():
                 'counts': counts_params,
                 'edge': edge_params,
                 'pathway': pathway_params,
-                'experimetn': expt_params
+                'experiment': expt_params
             }
+
+            # clean names
+            params = get_name_recursive(params)
 
             # save
             with open(self.folder / f'params.json', 'w') as f:
                 json.dump(params, f, indent=4, default=str)
 
-
-def grid(obj, *, prefix:str=None, suffix:str=None, **param_lists):
+def grid(obj, *, prefix:str|None=None, suffix:str|None=None, **param_lists):
     # init model dict
     objs = {}
 
@@ -618,110 +738,23 @@ def grid(obj, *, prefix:str=None, suffix:str=None, **param_lists):
         # get params
         params = dict(zip(keys,values))
 
-        # clean & build name
-        name = '_'.join([f'{clean_name(k)}{clean_name(v)}' for k,v in params.items()])
+        # build name
+        parts = [] 
+        for k,v in params.items():
+            ck = clean_name(k).replace('_','')
+            cv = clean_name(v).replace('_','')
+            cv = cv[:1].upper() + cv[1:] # capitalize first char
+            parts.append(f'{ck}{cv}')
+        name = '_'.join(parts)
 
         # add prefix, suffix
-        if prefix is not None:
-            name = f'{prefix}_{name}'
-        if suffix is not None:
-            name = f'{name}_{suffix}'
+        if prefix:
+            name = f'{clean_name(prefix)}_{name}'
+        if suffix:
+            name = f'{name}_{clean_name(suffix)}'
 
         # build config name & model
         objs[name] = obj(**params)
 
     return objs
 
-## Trainers
-
-class ClassifTrainer(Trainer):
-    def __init__(
-        self, 
-        lr:float, 
-        loss_class:type[nn.Module],
-        loss_kwargs:dict|None = None, 
-        optim_class:type[optim.Optimizer] = optim.Adam, 
-        optim_kwargs:dict|None = None, 
-        report_metrics:list[str]|None = None, 
-        *,
-        weight_method:Literal['none', 'balanced']|None = None,
-    ):
-        super().__init__(lr, loss_class, loss_kwargs, optim_class, optim_kwargs, report_metrics, weight_method=weight_method)
-        self.weight_method = 'none' if weight_method is None else weight_method
-    
-    def _init_loss(self, loader:Loader):
-        # get counts
-        class_counts = loader.stats['class_counts']
-        count = class_counts.sum()
-        num_classes = class_counts.numel()
-
-        # compute class weight
-        if self.weight_method == 'none': # no weighting
-            weight = None
-
-        elif self.weight_method == 'balanced': # scikitlearn approach
-            weight = count / (num_classes * class_counts) 
-            weight = weight / weight.mean() # normalize, mean = 1
-
-        else:
-            raise ValueError(f"weight_method should be in ['none','balanced'], got: {self.weight_method}")
-
-        # if weights needed externally
-        self.class_weight = weight
-
-        # construct loss function
-        if self.class_weight is None:
-            return self.loss_class(**self.loss_kwargs)
-        else:
-            return self.loss_class(weight=self.class_weight, **self.loss_kwargs)
-
-    def _compute_loss(self, batch):
-        # extract y
-        data = input_to_dict(batch)
-        y = data.get('y')
-
-        # forward pass
-        out = self.model(batch)
-        logits = out.get('y_logits')
-
-        # compute loss
-        loss = self.loss_fn(logits, y)
-
-        return loss, out
-    
-    def _compute_metrics(self, batch_log):
-        # init
-        metrics = {}
-
-        # compute loss
-        metrics['loss'] = batch_log['loss']/batch_log['num_batches']
-
-        # get outputs
-        x = torch.cat([batch['x'] for batch in batch_log['batch']])
-        y = torch.cat([batch['y'] for batch in batch_log['batch']])
-        y_logits = torch.cat([batch['y_logits'] for batch in batch_log['out']])
-
-        # compute metrics
-        kwargs = {
-            'preds':y_logits,
-            'target':y,
-            'task':'multiclass',
-            'num_classes':self.model.dims.num_classes
-        }
-        metrics['accuracy'] = accuracy(average='micro', **kwargs).item()
-        metrics['precision'] = precision(average="macro", **kwargs).item()
-        metrics['recall'] = recall(average='macro', **kwargs).item()
-        metrics['f1'] = f1_score(average="macro", **kwargs).item()
-        metrics['auroc'] = auroc(average="macro", **kwargs).item()
-
-        # get values
-        values = {
-            'x': x.cpu().numpy(),
-            'y': y.cpu().numpy(),
-            'y_logits': y_logits.cpu().numpy(),
-        }
-
-        return metrics, values
-
-
-##
