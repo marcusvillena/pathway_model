@@ -1,193 +1,233 @@
-from .utils import cloneable
+from .utils import cloneable, input_to_dict
+from .math import (
+    z_transform,
+    z_inv_transform,
+    nbvst_transform,
+    nbvst_inv_transform,
+    libnorm_transform,
+    libnorm_inv_transform,
+    nb_theta,
+    zinb_pi,
+)
 import torch
 import torch.nn as nn
 
 #typing
-from .train import Loader
+from .train import Loader, LoaderStats
 from torch import Tensor
+from typing import Callable, Sequence
 
-# parent
 @cloneable
 class Normalizer(nn.Module): 
     # parent class template, change in child
-    def __init__(self, learnable:bool=False):
+    def __init__(self, libnorm:bool=False, znorm:bool=False, learnable:bool=False, target_class:int|list[int]|None=None, eps:float=1e-8):
         super().__init__()
+        self.libnorm = libnorm
+        self.znorm = znorm
         self.learnable = learnable
+        self.target_class = target_class
+        self.eps = eps
 
         # placeholder dims
         self.num_nodes = None
         self.num_features = None
         self.register_buffer('mean', None)
         self.register_buffer('std', None)
-        self.register_buffer('mu', None)
         self.register_buffer('theta', None) 
+        self.register_buffer('pi', None)
+        self.register_buffer('libscale', None)
 
     def _check_initialized(self):
         if self.num_nodes is None or self.num_features is None:
             raise ValueError("Normalizer not initialized. Call 'init_with_loader' with a Loader to initialize.")
-
-    def _z_transform(self, x:Tensor) -> Tensor:
-        return (x - self.mean)/self.std
-
-    def _inverse_z_transform(self, z:Tensor) -> Tensor:
-        return (z * self.std) + self.mean
     
     def _reshape_and_record(self, x:Tensor) -> tuple[Tensor, torch.Size]:
         orig_shape = x.shape
         x = x.reshape(-1, self.num_nodes, self.num_features)
         return x, orig_shape
 
-    def init_with_loader(self, loader:Loader):
+    def init_with_loader(self, loader:Loader, transform:Callable|None=None, **update_kwargs):
         self.num_nodes = loader.num_nodes
         self.num_features = loader.num_features
+        dataloader = loader.train_loader
+        libscale = loader.stats['lib_median']
 
-    def transform(self, x) -> Tensor:
-        return x
-    
-    def inverse_transform(self, x) -> Tensor:
-        return x
+        # init trackers
+        _stats = LoaderStats(self.num_nodes, self.num_features, transform=transform, eps=self.eps)
 
-# raw (no VST)
+        for batch in dataloader:
+            x = _stats.filter_batch(batch, target_class=self.target_class)
+
+            # skip if no samples (after filtering)
+            if x is None:
+                continue
+            
+            # transforms 
+            if self.libnorm:
+                x = libnorm_transform(x, libscale=libscale)
+
+            # update trackers
+            _stats.update(x, **update_kwargs)
+
+        if _stats.count == 0:
+            raise ValueError("No samples found for the specified class(es).")
+        
+        # compute stats
+        mean, _, std = _stats.compute()
+
+        # add to self
+        if self.learnable:
+            self.mean = nn.Parameter(mean)
+            self.std = nn.Parameter(std)
+            self.theta = nn.Parameter(loader.stats['theta'])
+            self.pi = nn.Parameter(loader.stats['pi'])
+            self.libscale = nn.Parameter(libscale)
+        else:
+            self.register_buffer('mean', mean)
+            self.register_buffer('std', std)
+            self.register_buffer('theta', loader.stats['theta'])
+            self.register_buffer('pi', loader.stats['pi'])
+            self.register_buffer('libscale', libscale)
+
+    def transform(self, x:Tensor) -> Tensor:
+        x, orig_shape = self._reshape_and_record(x)
+
+        if self.libnorm or self.znorm:
+            self._check_initialized()
+
+        if self.libnorm:
+            x = libnorm_transform(x, libscale=self.libscale)
+
+        # for child class, transform should happen here
+
+        if self.znorm:
+            x = z_transform(x, self.mean, self.std)
+
+        return x.reshape(orig_shape)
+
+    def inverse_transform(self, x:Tensor, libsize:float|None=None) -> Tensor:
+        x, orig_shape = self._reshape_and_record(x)
+
+        if self.libnorm or self.znorm:
+            self._check_initialized()
+
+        if self.znorm:
+            x = z_inv_transform(x, self.mean, self.std)
+
+        # for child class, transform should happen here
+
+        if self.libnorm and libsize is not None:
+            x = libnorm_inv_transform(x, libsize=libsize, libscale=self.libscale)
+
+        return x.reshape(orig_shape)
+
+@cloneable
 class RawCounts(Normalizer):
     pass
 
-class zRawCounts(RawCounts):
-    def init_with_loader(self, loader:Loader):
-        # num_nodes, num_features
-        super().init_with_loader(loader)
+@cloneable
+class LogCounts(Normalizer):
+    # DESeq2-like
+    def init_with_loader(self, loader:Loader, transform:Callable=torch.log1p):
+        super().init_with_loader(loader, transform)
 
-        # mean, std
-        if self.learnable:
-            self.mean = nn.Parameter(loader.stats['mean'])
-            self.std = nn.Parameter(loader.stats['std'])
-        else:
-            self.register_buffer('mean', loader.stats['mean'])
-            self.register_buffer('std', loader.stats['std'])
-
-    def transform(self, x:Tensor):
-        self._check_initialized()
+    def transform(self, x:Tensor) -> Tensor:
         x, orig_shape = self._reshape_and_record(x)
-        z = self._z_transform(x)
-        return z.reshape(orig_shape)
-    
-    def inverse_transform(self, z:Tensor):
-        self._check_initialized()
-        z, orig_shape = self._reshape_and_record(z)
-        x = self._inverse_z_transform(z)
+
+        if self.libnorm or self.znorm:
+            self._check_initialized()
+
+        if self.libnorm:
+            x = libnorm_transform(x, libscale=self.libscale)
+
+        # x -> log(x)
+        x = torch.log1p(x)
+
+        if self.znorm:
+            x = z_transform(x, self.mean, self.std)
+
         return x.reshape(orig_shape)
 
-# log VSTs
-@cloneable
-class logVST(Normalizer):
-    def transform(self, x) -> Tensor:
-        return torch.log1p(x)
+    def inverse_transform(self, x:Tensor, libsize:float|None=None) -> Tensor:
+        x, orig_shape = self._reshape_and_record(x)
 
-    def inverse_transform(self, x) -> Tensor:
-        return torch.expm1(x)
-    
-@cloneable
-class zlogVST(logVST):
-    def init_with_loader(self, loader:Loader):
-        # num_nodes, num_features
-        super().init_with_loader(loader)
+        if self.libnorm or self.znorm:
+            self._check_initialized()
 
-        # mean, std (log)
-        if self.learnable:
-            self.mean = nn.Parameter(loader.stats['log_mean'])
-            self.std = nn.Parameter(loader.stats['log_std'])
-        else:
-            self.register_buffer('mean', loader.stats['log_mean'])
-            self.register_buffer('std', loader.stats['log_std'])
+        if self.znorm:
+            x = z_inv_transform(x, self.mean, self.std)
 
-    def transform(self, x:Tensor):
-        self._check_initialized()
-        log_x = super().transform(x) # log1p
-        log_x, orig_shape = self._reshape_and_record(log_x)
-        z = self._z_transform(log_x)
-        return z.reshape(orig_shape)
-    
-    def inverse_transform(self, z:Tensor):
-        self._check_initialized()
-        z, orig_shape = self._reshape_and_record(z)
-        log_x = self._inverse_z_transform(z)
-        x = super().inverse_transform(log_x) # expm1
+        # log(x) -> x
+        x = torch.expm1(x) 
+
+        if self.libnorm and libsize is not None:
+            x = libnorm_inv_transform(x, libsize=libsize, libscale=self.libscale)
+
         return x.reshape(orig_shape)
-
-# NB VSTs
+    
 @cloneable
 class NBVST(Normalizer):
-    def __init__(self, learnable:bool=False, c:float=3.0/8.0, eps:float=1e-8):
-        super().__init__(learnable)
-        self.c = c
-        self.eps = eps
+    def init_with_loader(self, loader:Loader, transform:Callable=nbvst_transform):
+        theta = loader.stats['theta']
+        super().init_with_loader(loader, transform, theta=theta)
 
-    def init_with_loader(self, loader:Loader):
-        # num_nodes, num_features
-        super().init_with_loader(loader)
+    def transform(self, x:Tensor) -> Tensor:
+        self._check_initialized() # theta must exist
+        x, orig_shape = self._reshape_and_record(x)            
 
-        # mu, theta
-        theta = torch.clamp(loader.stats['theta'], min=self.eps)
-        if self.learnable:
-            self.mu = nn.Parameter(loader.stats['mean'])
-            self.theta = nn.Parameter(theta)
-        else:
-            self.register_buffer('mu', loader.stats['mean'])
-            self.register_buffer('theta', theta)
+        if self.libnorm:
+            x = libnorm_transform(x, libscale=self.libscale)
 
-    def transform(self, x:Tensor):
-        self._check_initialized()
-        x, orig_shape = self._reshape_and_record(x)
+        # NB VST
+        x = nbvst_transform(x, self.theta)
 
-        # NB anscombe transform
-        theta = torch.clamp(self.theta, min=self.eps) # safe
-        radicand = torch.clamp(theta * (x + self.c), min=0.0)
-        x_nb = (2.0 / torch.sqrt(theta)) * torch.asinh(torch.sqrt(radicand + self.eps))
-
-        return x_nb.reshape(orig_shape)
-    
-    def inverse_transform(self, x_nb:Tensor):
-        self._check_initialized()
-        x_nb, orig_shape = self._reshape_and_record(x_nb)
-
-        # inverse NB anscombe
-        theta = torch.clamp(self.theta, min=self.eps) # safe
-        sinh_term = torch.sinh(x_nb * torch.sqrt(theta) / 2.0)
-        x = (sinh_term.pow(2) / theta) - self.c
+        if self.znorm:
+            x = z_transform(x, self.mean, self.std)
 
         return x.reshape(orig_shape)
 
-@cloneable
-class zNBVST(NBVST):
-    def init_with_loader(self, loader:Loader):
-        # num_nodes, num_features; mu, theta
-        super().init_with_loader(loader)
+    def inverse_transform(self, x:Tensor, libsize:float|None=None) -> Tensor:
+        self._check_initialized() # theta must exist
+        x, orig_shape = self._reshape_and_record(x)            
 
-        # mean, std (nb)
-        if self.learnable:
-            self.mean = nn.Parameter(loader.stats['nb_mean'])
-            self.std = nn.Parameter(loader.stats['nb_std'])
-        else:
-            self.register_buffer('mean', loader.stats['nb_mean'])
-            self.register_buffer('std', loader.stats['nb_std'])
+        if self.znorm:
+            x = z_inv_transform(x, self.mean, self.std)
 
-    def transform(self, x):
-        x_nb = super().transform(x) # NB VST
-        x_nb, orig_shape = self._reshape_and_record(x_nb)
-        z = self._z_transform(x_nb)
-        return z.reshape(orig_shape)
+        # inverse NB VST
+        x = nbvst_inv_transform(x, self.theta)
 
-    def inverse_transform(self, z):
-        z, orig_shape = self._reshape_and_record(z)
-        x_nb = self._inverse_z_transform(z)
-        x = super().inverse_transform(x_nb) # inverse NB VST
+        if self.libnorm and libsize is not None:
+            x = libnorm_inv_transform(x, libsize=libsize, libscale=self.libscale)
+
         return x.reshape(orig_shape)
 
-# compatibility
-@cloneable
-class logNorm(logVST):
-    pass
+# ideas
+    # PearsonZINBVST
+        # Transform: t = (x - mean)/zinbstd
+            # zinbstd <- mean + (mean^2)/(1-pi) * (pi + 1/theta)
+        # Standardize: z = (t - mean(t))/std(t)
 
-@cloneable
-class ZlogNorm(zlogVST):
-    pass
+    # HybridZINBVST
+        # Transform: t = T(x) / zinbstd
+            # T(x) <- Anscombe-like nb(x) or log1p(x)
+            # zinbstd <- mean + (mean^2)/(1-pi) * (pi + 1/theta)
+        # Standardize: z = (t - mean(t))/std(t)
+
+    # zero-inflation should probably be its own test/grid...
+    # too many ways to handle it
+
+# new class: LibraryNorm vs. CountNorm (current)
+    # x_transformed = x_gi / (s_i / target)
+        # x, per gene, per individual
+        # normalized by s per individual (s_i) = sum(x_gi for g in G)
+        # target: median library size, geometric mean lib size, etc.
+
+    # other implementations:
+        # DESeq2 -> median-of-ratios
+        # edgeR -> trimmed mean of M-values (TMM)
+        # scVI -> in decoder
+
+    # library normalization would have to occur per-sample, thus in the model itself (not Loader)
+    # for batch-wise stats (e.g. for initializing weights), these can go in Loader (e.g. for scVI latent libsize)
+
 

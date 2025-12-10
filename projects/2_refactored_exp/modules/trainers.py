@@ -1,4 +1,5 @@
 from .loss import LossWrapper
+from .math import library_size
 from .norm import Normalizer
 from .train import Loader, Trainer
 from torchmetrics.functional.classification import accuracy, precision, recall, f1_score, auroc
@@ -147,7 +148,8 @@ class ReconstrTrainer(Trainer):
         x = torch.cat([batch[target_key] for batch in batch_log['data']])
 
         # model space -> raw space
-        x_preds_raw: Tensor = self.model.encoder.norm.inverse_transform(x_preds)
+        libsize = library_size(x, num_nodes=self.model.dims.num_nodes, num_features=self.model.dims.num_node_features)
+        x_preds_raw: Tensor = self.model.encoder.norm.inverse_transform(x_preds, libsize=libsize).detach()
 
         # raw space -> trainer space
         x_preds = self.norm.transform(x_preds_raw)

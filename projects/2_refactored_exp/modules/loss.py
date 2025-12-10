@@ -67,8 +67,55 @@ class LossWrapper(nn.Module):
 
         return filter_kwargs(self.loss_fn.forward)(*pos_args, **extra_kwargs)
 
+def reduce_loss(x:Tensor, reduction:Literal['none','sum','mean']='mean'):
+    # reduces/aggregates loss output
+    if reduction == 'none':
+        return x 
+    if reduction == 'sum':
+        return x.sum() 
+    if reduction == 'mean':
+        return x.mean()
+    else:
+        raise ValueError(f"Unknown reduction method: '{reduction}'")
+
+class MultiLoss(nn.Module):
+    def __init__(self, loss_classes:type[nn.Module]|list[type[nn.Module]], **kwargs):
+        super().__init__()
+
+        # ensure list
+        if not isinstance(loss_classes, list):
+            loss_classes = [loss_classes]
+
+        # initialize loss funcs
+        self.loss_fns = [filter_kwargs(loss_class)(**kwargs) for loss_class in loss_classes]
+
+    def forward(self, *args, **kwargs):
+        pass
+
+
+
+    
+
+class KLDLoss(nn.Module):
+    # KL divergence los between Norm(mu, sigma^2) and Norm(0, I)
+    # !!! consider KL annealing/scheduling !!!
+    def __init__(self, reduction:Literal['none','sum','mean']='mean'):
+        super().__init__()
+        self.reduction = reduction
+
+    def forward(self, mu:Tensor, logvar:Tensor):
+        # per-sample loss
+        kl = -0.5 * torch.sum(1 + logvar - mu.pow(2) - logvar.exp(), dim=1)
+
+        # reduce
+        kl = reduce_loss(kl, self.reduction)
+
+        return kl
+    
+
+
 class NBLoss(nn.Module):
-    def __init__(self, eps:float=1e-8, reduction:Literal['none', 'mean', 'sum']='mean', *args, **kwargs):
+    def __init__(self, eps:float=1e-8, reduction:Literal['none','sum','mean']='mean', *args, **kwargs):
         super().__init__(*args, **kwargs)
         self.eps = eps
         self.reduction = reduction

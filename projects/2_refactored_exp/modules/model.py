@@ -33,14 +33,12 @@ class Encoder(nn.Module):
 
         # kwargs
         norm_kwargs: dict | None = None,
-        encoder_kwargs: dict | None = None,
         pooling_kwargs: dict | None = None,
 
         *args, **kwargs
     ):
         super().__init__(*args, **kwargs)
         norm_kwargs = {} if norm_kwargs is None else norm_kwargs
-        encoder_kwargs = {} if encoder_kwargs is None else encoder_kwargs
         pooling_kwargs = {} if pooling_kwargs is None else pooling_kwargs
         self.method=method
 
@@ -72,7 +70,6 @@ class Encoder(nn.Module):
                 act_fn=act_fn,
                 norm_fn=norm_fn,
                 end_fn=end_fn,
-                layer_kwargs=encoder_kwargs,
             )
         )
 
@@ -192,6 +189,7 @@ class Latent(nn.Module):
         # layers
         mlp: bool | nn.Module = False,
         pooling_class: SetPooling | type[SetPooling] = SetPooling,
+        variational: bool | nn.Module = False,
 
         # new layer params
         hidden_dims: int | list[int] | None = None, 
@@ -200,12 +198,10 @@ class Latent(nn.Module):
         end_fn: bool | nn.Module = False,
 
         # kwargs
-        mlp_kwargs: dict | None = None,
         pooling_kwargs: dict | None = None,
         *args, **kwargs
     ):
         super().__init__(*args, **kwargs)
-        mlp_kwargs = {} if mlp_kwargs is None else mlp_kwargs
         pooling_kwargs = {} if pooling_kwargs is None else pooling_kwargs
         
         # dims
@@ -231,7 +227,6 @@ class Latent(nn.Module):
                     act_fn=act_fn,
                     norm_fn=norm_fn,
                     end_fn=end_fn,
-                    layer_kwargs=mlp_kwargs,
                 )
             )
 
@@ -252,6 +247,27 @@ class Latent(nn.Module):
             )
         )
 
+        # vae head
+        if variational is False:
+            self.gaussian = None
+        else:
+            if variational is True: # use default (nn.Linear)
+                variational = nn.Linear 
+            self.gaussian = clone_or_init(
+                name='variational',
+                obj=variational,
+                base_class=nn.Module,
+                builder=lambda cls: Sequential(
+                    in_channels=self.embed_dim,
+                    out_channels=2*self.embed_dim,
+                    layer_class=cls,
+                    hidden_dims=hidden_dims,
+                    act_fn=act_fn,
+                    norm_fn=norm_fn,
+                    end_fn=end_fn,
+                )
+            )
+
     def _pool(self, x:Tensor, need_weights:bool):
         # get pooled embedding
         pool_out = self.pooling(x, concat=False, return_dict=need_weights)
@@ -259,12 +275,25 @@ class Latent(nn.Module):
         # extract output
         if isinstance(pool_out, Tensor):
             x = pool_out
+            pool_out = None
         else:
             pool_out = input_to_dict(pool_out) # extract as dict
             x = pool_out.pop('x')
 
         return x, pool_out
-        
+
+    def _reparameterize(self, x:Tensor):
+        # get vae params
+        x = self.gaussian(x)
+
+        # reparameterize
+        z_mu, z_logvar = x.chunk(2, dim=-1)
+        z_std = torch.exp(0.5 * z_logvar)
+        z_eps = torch.randn_like(z_std)
+        z = z_mu + z_std * z_eps
+
+        return z, z_mu, z_logvar
+
     def forward(self, input:Union[Data, Tensor, dict], need_weights:bool=False):
         # get input as dict
         data = input_to_dict(input)
@@ -276,6 +305,16 @@ class Latent(nn.Module):
         # pool
         data['x'], lp_out = self._pool(data['x'], need_weights)
         data['x'] = data['x'].squeeze(1) # flatten to (b,F)
+
+        # variational
+        if self.gaussian is not None:
+            z, z_mu, z_logvar = self._reparameterize(data['x'])
+            data['x'] = z
+            data['z_mu'] = z_mu
+            data['z_logvar'] = z_logvar
+        else:
+            data['z_mu'] = None
+            data['z_logvar'] = None
 
         if need_weights:
             data['layer_outs']['lp'] = lp_out
@@ -299,6 +338,7 @@ class BaseModel(nn.Module):
         encoder_class: nn.Module | type[nn.Module] | None = None, # encoder
         pooling_class: SetPooling | type[SetPooling] = SetPooling, # encoder, latent
         mlp: bool | nn.Module = False, # latent
+        variational: bool | nn.Module = False,  # latent
         out_module: nn.Module | type[nn.Module] = nn.Linear, # output
 
         # new layer params
@@ -309,17 +349,11 @@ class BaseModel(nn.Module):
 
         # kwargs
         norm_kwargs: dict | None = None, # encoder
-        encoder_kwargs: dict | None = None, # encoder
         pooling_kwargs: dict | None = None, # encoder, latent
-        mlp_kwargs: dict | None = None, # latent
-        out_kwargs: dict | None = None, # output
     ):
         super().__init__()
         norm_kwargs = {} if norm_kwargs is None else norm_kwargs
-        encoder_kwargs = {} if encoder_kwargs is None else encoder_kwargs
         pooling_kwargs = {} if pooling_kwargs is None else pooling_kwargs
-        mlp_kwargs = {} if mlp_kwargs is None else mlp_kwargs
-        out_kwargs = {} if out_kwargs is None else out_kwargs
 
         # get dims
         self.dims = Dims(
@@ -336,14 +370,14 @@ class BaseModel(nn.Module):
             dims=self.dims, method=method,
             norm_class=norm_class, encoder_class=encoder_class, pooling_class=pooling_class,
             hidden_dims=self.hidden_dims, act_fn=act_fn, norm_fn=norm_fn, end_fn=end_fn,
-            norm_kwargs=norm_kwargs, encoder_kwargs=encoder_kwargs, pooling_kwargs=pooling_kwargs
+            norm_kwargs=norm_kwargs, pooling_kwargs=pooling_kwargs
         )
 
         self.latent = Latent(
             dims=self.dims,
-            mlp=mlp, pooling_class=pooling_class,
+            mlp=mlp, pooling_class=pooling_class, variational=variational,
             hidden_dims=self.hidden_dims, act_fn=act_fn, norm_fn=norm_fn, end_fn=end_fn,
-            mlp_kwargs=mlp_kwargs, pooling_kwargs=pooling_kwargs
+            pooling_kwargs=pooling_kwargs
         )
 
         self.out_layer = clone_or_init(
@@ -358,7 +392,6 @@ class BaseModel(nn.Module):
                 act_fn=act_fn,
                 norm_fn=norm_fn,
                 end_fn=False, # no final layer, output raw logits
-                layer_kwargs=out_kwargs,
             )
         )
 
@@ -403,6 +436,7 @@ class BaseClassifier(BaseModel):
         encoder_class: nn.Module | type[nn.Module] | None = None, # encoder
         pooling_class: SetPooling | type[SetPooling] = SetPooling, # encoder, latent
         mlp: bool | nn.Module = False, # latent
+        variational: bool | nn.Module = False, # latent
         out_module: nn.Module | type[nn.Module] = nn.Linear, # output
 
         # new layer params
@@ -413,10 +447,7 @@ class BaseClassifier(BaseModel):
 
         # kwargs
         norm_kwargs: dict | None = None, # encoder
-        encoder_kwargs: dict | None = None, # encoder
         pooling_kwargs: dict | None = None, # encoder, latent
-        mlp_kwargs: dict | None = None, # latent
-        out_kwargs: dict | None = None, # output
     ):
         # default: out_dim = num_classes (for classification)
         out_dim = dataset.num_classes if out_dim is None else out_dim
@@ -424,9 +455,9 @@ class BaseClassifier(BaseModel):
         # call init
         super().__init__(
             dataset, out_dim, embed_dim, head_dim, num_heads, method,
-            norm_class, encoder_class, pooling_class, mlp, out_module,
+            norm_class, encoder_class, pooling_class, mlp, variational, out_module,
             hidden_dims, act_fn, norm_fn, end_fn,
-            norm_kwargs, encoder_kwargs, pooling_kwargs, mlp_kwargs, out_kwargs
+            norm_kwargs, pooling_kwargs,
         )
 
     def forward(self, input:Union[Data, Tensor, dict], need_weights:bool=False):
@@ -457,6 +488,7 @@ class BaseAutoencoder(BaseModel):
         encoder_class: nn.Module | type[nn.Module] | None = None, # encoder
         pooling_class: SetPooling | type[SetPooling] = SetPooling, # encoder, latent
         mlp: bool | nn.Module = False, # latent
+        variational: bool | nn.Module = False, # latent
         out_module: nn.Module | type[nn.Module] = nn.Linear, # output
 
         # new layer params
@@ -467,20 +499,17 @@ class BaseAutoencoder(BaseModel):
 
         # kwargs
         norm_kwargs: dict | None = None, # encoder
-        encoder_kwargs: dict | None = None, # encoder
         pooling_kwargs: dict | None = None, # encoder, latent
-        mlp_kwargs: dict | None = None, # latent
-        out_kwargs: dict | None = None, # output
     ):
-        # default: out_dim = num_classes (for classification)
+        # default: out_dim = num_nodes (for reconstruction)
         out_dim = dataset[0].num_nodes if out_dim is None else out_dim
 
         # call init
         super().__init__(
             dataset, out_dim, embed_dim, head_dim, num_heads, method,
-            norm_class, encoder_class, pooling_class, mlp, out_module,
+            norm_class, encoder_class, pooling_class, mlp, variational, out_module,
             hidden_dims, act_fn, norm_fn, end_fn,
-            norm_kwargs, encoder_kwargs, pooling_kwargs, mlp_kwargs, out_kwargs
+            norm_kwargs, pooling_kwargs
         )
 
     def forward(self, input:Union[Data, Tensor, dict], need_weights:bool=False):

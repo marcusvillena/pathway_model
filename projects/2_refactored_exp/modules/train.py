@@ -1,9 +1,10 @@
 # general
+from .utils import cloneable, capture_kwargs, clean_name, get_name_recursive, filter_kwargs, input_to_dict
 import torch
 import torch.nn as nn
-from .utils import capture_kwargs, clean_name, get_name_recursive, filter_kwargs, input_to_dict
 
 # loader
+from .math import nb_theta, zinb_pi, library_size
 from torch.utils.data import random_split
 from torch_geometric.loader import DataLoader
 
@@ -28,36 +29,65 @@ import itertools
 
 # typing
 from .data import DataWrapper
-from torch import  Tensor
+from torch import Tensor
 from torch_geometric.data import Data, Batch
-from typing import Literal, Sequence, Union
+from torch_geometric.loader import DataLoader
+from typing import Callable, Literal, Sequence, Union
 
-class LoaderStats():
-    def __init__(self, num_nodes:int, num_features:int, eps:float=1e-8):
-        # dims
+## Loader
+@cloneable
+class LoaderStats(nn.Module):
+    def __init__(self, num_nodes:int, num_features:int, transform:Callable|None=None, eps:float=1e-8):
+        super().__init__()
         self.num_nodes = num_nodes
         self.num_features = num_features
+        self.transform = transform
         self.eps = eps
 
-        # trackers, (n,f)
+        # trackers (n,f); always on
         self.sum_x = torch.zeros(self.num_nodes, self.num_features)
         self.sum_x2 = torch.zeros(self.num_nodes, self.num_features)
+        self.count = 0
 
-    def update(self, x:Tensor):
+    def filter_batch(self, batch, target_class:int|list[int]|None=None):
+        data = input_to_dict(batch)
+        x = data['x'].reshape(-1, self.num_nodes, self.num_features) # (b,n,f)
+
+        # skip filtering if no target class
+        if target_class is None:
+            return x
+        
+        # apply class filtering if applicable, mask in (b,)
+        y = data['y']  # (b,)
+        mask = torch.isin(y, target_class.to(device=y.device, dtype=y.dtype))
+
+        # filter, else skip if no samples
+        if mask.any():
+            x = x[mask]
+            return x
+        else:
+            return None
+            
+    def update(self, x:Tensor, **kwargs):
+        # transform if applicable
+        if callable(self.transform):
+            x = self.transform(x, **kwargs)
+
         # update sums, (n,f)
         self.sum_x += x.sum(dim=0)
-        self.sum_x2 += (x**2).sum(dim=0)
+        self.sum_x2 += x.pow(2).sum(dim=0)
+        self.count += x.size(0)
 
-    def compute(self, count:int):
+    def compute(self):
         # compute mean, var, std in (n,f)
-        mean = self.sum_x / count
-        var = torch.clamp((self.sum_x2/count) - (mean.pow(2)), min=0.0)
-        std = torch.clamp(torch.sqrt(var), min=self.eps)
+        mean = self.sum_x / self.count
+        var = torch.clamp(self.sum_x2/self.count - mean.pow(2), min=0.0)
+        std = torch.clamp(var.sqrt(), min=self.eps)
 
         return mean, var, std
-    
+
 class Loader():
-    def __init__(self, dataset:DataWrapper, device:str, batch_size:int=16, val_size:int=0.15, test_size:int=0.15, eps:float=1e-8, stats_kwargs:dict=None):
+    def __init__(self, dataset:DataWrapper, device:str, batch_size:int=16, val_size:int=0.15, test_size:int=0.15, eps:float=1e-8):
         # init seed, generator
         self.seed = torch.seed()
         generator = torch.Generator(device=device).manual_seed(self.seed)
@@ -85,115 +115,41 @@ class Loader():
         self.num_classes = self.dataset.num_classes
 
         # get stats
-        stats_kwargs = {} if stats_kwargs is None else stats_kwargs
-        self.stats = self.get_stats(loader=self.train_loader, **stats_kwargs)
+        self.stats = self.get_stats(self.train_loader)
 
-    def _get_theta(self, mean:Tensor, var:Tensor, theta_lambda:float=0.5, theta_min:float=1e-6, theta_max:float=1e6):
-        # compute theta from mean, var (method of moments)
-        theta = mean.pow(2) / torch.clamp(var - mean, min=self.eps)  # avoid div0
-
-        # mask finite values
-        mask = torch.isfinite(theta) & (theta > 0)
-
-        # get global theta (median of finite thetas)
-        theta_global = torch.median(theta[mask]) if mask.any() else theta.new_tensor(1.0)
-
-        # smooth with global and clamp
-        theta = (1-theta_lambda) * theta + theta_lambda * theta_global
-        theta = torch.clamp(theta, min=theta_min, max=theta_max)  
-
-        return theta
-
-    def _filter_batch(self, batch, target_class:int|Sequence[int]|None):
-        data = input_to_dict(batch)
-        x = data['x'].reshape(-1, self.num_nodes, self.num_features) # (b,n,f)
-        y = data['y']  # (b,)
-
-        # skip filtering if no target class
-        if target_class is None:
-            return x, y
-        
-        # apply class filtering if applicable, mask in (b,)
-        mask = torch.isin(y, target_class.to(device=y.device, dtype=y.dtype))
-
-        # return None if no samples; skips in loop 
-        if not mask.any():
-            return None, y  
-        
-        # filter x, y remains unfiltered
-        x = x[mask]
-
-        return x, y
-
-    def get_stats(self, loader:DataLoader, target_class:int|Sequence[int]|None=None):
-        # init trackers
-        raw_stats = LoaderStats(self.num_nodes, self.num_features, eps=self.eps)
-        log_stats = LoaderStats(self.num_nodes, self.num_features, eps=self.eps)
+    def get_stats(self, dataloader:DataLoader):
+        # count trackers
+        _stats = LoaderStats(self.num_nodes, self.num_features, eps=self.eps)
         class_counts = torch.zeros(self.num_classes, dtype=torch.long)
-        count = 0
-        
-        # ensure target_class is list -> tensor
-        if target_class is not None:
-            target_class = torch.as_tensor(target_class)
+        zero_count = torch.zeros(self.num_nodes, self.num_features, dtype=torch.long)
+        lib_median = []
 
         # compute for all batches in loader
-        for batch in loader:
-            x,y = self._filter_batch(batch, target_class)
+        for batch in dataloader:
+            # extract data
+            data = input_to_dict(batch)
+            x = data['x'].reshape(-1, self.num_nodes, self.num_features) # (b,n,f)
+            y = data['y'] # (b,)
 
-            # update class counts, regardless of filtering
+            # update counts
+            _stats.update(x)
             class_counts += torch.bincount(y, minlength=class_counts.numel())
+            zero_count += (x==0).sum(dim=0)
+            lib_median.append(library_size(x).to(torch.float32))
 
-            # skip if no samples for target class post-filtering
-            if x is None:
-                continue 
+        # compute stats
+        mean, var, _ = _stats.compute()
+        theta = nb_theta(mean, var, eps=self.eps)
+        pi = zinb_pi(mean, theta, zero_count, _stats.count, eps=self.eps)
+        lib_median = torch.cat(lib_median).median()
 
-            # log transform
-            log_x = torch.log1p(x)
-
-            # update
-            raw_stats.update(x)
-            log_stats.update(log_x)
-            count += x.size(0)
-
-        # ensure samples present (avoid div0) 
-        if count == 0: 
-            raise ValueError("No samples found for the specified class(es).")
-
-        # compute mean, var, std, theta in (n,f)
-        mean, var, std = raw_stats.compute(count)
-        log_mean, log_var, log_std = log_stats.compute(count)
-        theta = self._get_theta(mean, var)
-
-        # compute NBVST stats (2nd pass)
-        nb_stats = LoaderStats(self.num_nodes, self.num_features, eps=self.eps)
-
-        for batch in loader:
-            x, _ = self._filter_batch(batch, target_class)
-            if x is None:
-                continue  # skip if no samples for target class
-
-            # NB anscombe transform
-            radicand = torch.clamp(theta * (x + 3.0/8.0), min=0.0)
-            x_nb = (2.0 / torch.sqrt(theta)) * torch.asinh(torch.sqrt(radicand + self.eps))
-
-            # update
-            nb_stats.update(x_nb)
-
-        # compute NBVST mean, var, std in (n,f)
-        nb_mean, nb_var, nb_std = nb_stats.compute(count)
-
-        # add batch dim, return (1,n,f)
         return {
-            'mean': mean.unsqueeze(0),
-            'std': std.unsqueeze(0),
-            'log_mean': log_mean.unsqueeze(0),
-            'log_std': log_std.unsqueeze(0),
-            'nb_mean': nb_mean.unsqueeze(0),
-            'nb_std': nb_std.unsqueeze(0),
-            'theta': theta.unsqueeze(0),
-            'class_counts': class_counts
+            'theta': theta,
+            'pi': pi,            
+            'class_counts': class_counts,
+            'lib_median': lib_median
         }
-
+    
 class Trainer():
     def __init__(
         self, 
