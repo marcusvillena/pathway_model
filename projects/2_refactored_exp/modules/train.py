@@ -10,6 +10,7 @@ from torch_geometric.loader import DataLoader
 
 # trainer
 from .loss import LossWrapper
+from .math import ExpMovingAverage
 from tqdm.auto import tqdm
 import copy
 import inspect
@@ -149,7 +150,100 @@ class Loader():
             'class_counts': class_counts,
             'lib_median': lib_median
         }
+
+class EarlyStopping():
+    def __init__(
+        self,
+        warmup: int = 50,
+        patience: int = 50,
+        mode: Literal['min', 'max'] = 'min',                                   
+        confidence: float = 0.95,
+        decay: float = 0.95,
+    ):
+        self.warmup = int(warmup)
+        self.patience = int(patience)
+        self.mode = mode
+
+        # stats
+        self.ema = ExpMovingAverage(alpha=float(decay), warmup=self.warmup)
+        self.z = stats.norm.ppf(0.5 + float(confidence) / 2.0)
+
+        # tracking variables
+        self.best_epoch: int|None = None
+        self.best_value: float|None = None
+        self.criteria: float|None = None
+        self.counter: int = 0
+        self.should_stop: bool = False
+
+        # model
+        self.best_state: dict[str, Tensor]|None = None
     
+    def _update_criteria(self) -> float|None:
+        # recomputes criteria: best val +- moe (ci)
+        moe = self.ema.moe(self.z)
+        moe = 0.0 if moe is None else float(moe)
+
+        if self.mode == 'min':
+            return self.best_value - moe
+        else:
+            return self.best_value + moe
+
+    def _better(self, current:float, target:float) -> bool:
+        return current < target if self.mode == 'min' else current > target
+
+    def update(self, x:float|Tensor, epoch:int) -> None:
+        # convert to float
+        if torch.is_tensor(x):
+            x = x.detach().item()
+        x = float(x)
+
+        # update
+        self.ema.update(x)
+
+        # initialize
+        if self.best_value is None or self.criteria is None:
+            self.best_value = x # update best value
+            self.best_epoch = epoch # update best epoch
+            self.criteria = self._update_criteria() # update criteria
+            self.counter = 0 # reset counter
+            return
+
+        # update best value, if better
+        if self._better(x, self.best_value):
+            self.best_value = x
+            self.best_epoch = epoch
+
+        # update criteria, if improved
+        if self._better(x, self.criteria):
+            self.criteria = self._update_criteria()
+            self.counter = 0 # reset counter
+
+        # apply patience after warmup
+        elif epoch >= self.warmup:
+            self.counter += 1
+            if self.counter >= self.patience:
+                self.should_stop = True
+
+    def update_and_save(self, x:dict|float|Tensor, epoch:int, model:nn.Module, metric:str|None = None) -> None:
+        # extract metric if dict
+        if isinstance(x, dict):
+            if metric is None:
+                raise ValueError("metric must be provided when x is a dict")
+            if metric not in x:
+                raise KeyError(f"metric={metric!r} not found in keys={list(x.keys())}")
+            x = x[metric]
+
+        # update, best epoch etc.
+        self.update(x, epoch)
+
+        # if best epoch, save model state
+        if self.best_epoch == epoch:
+            self.best_state = {
+                k: v.detach().cpu().clone() 
+                for k, v in model.state_dict().items()
+            }
+
+
 class Trainer():
     def __init__(
         self, 
@@ -161,6 +255,9 @@ class Trainer():
         loss_kwargs: dict | None = None,
         optim_class: type[optim.Optimizer] = optim.Adam, 
         optim_kwargs: dict | None = None,
+        early_stop: bool = False,
+        stop_metric: str = 'loss',
+        stop_kwargs: dict | None = None,
         **kwargs # pass child kwargs to capture_kwargs
     ):
         # ensure loss_class is provided
@@ -195,6 +292,9 @@ class Trainer():
         self.loss_kwargs = {} if loss_kwargs is None else dict(loss_kwargs)
         self.optim_class = optim_class
         self.optim_kwargs = {} if optim_kwargs is None else dict(optim_kwargs)
+        self.early_stop = early_stop
+        self.stop_metric = stop_metric
+        self.stop_kwargs = {} if stop_kwargs is None else dict(stop_kwargs)
 
     def run(self, model:nn.Module, loader:Loader, num_epochs:int, report_metrics:str|list[str]|None=None, verbose:bool=False):
         # defaults
@@ -216,6 +316,9 @@ class Trainer():
 
         # train, val loop
         self.dev_metrics = {}
+
+        # early stopping
+        stopper = EarlyStopping(**self.stop_kwargs) if self.early_stop else None
 
         # start timer
         if torch.cuda.is_available(): torch.cuda.synchronize()
@@ -240,6 +343,14 @@ class Trainer():
             epoch_report = f'Epoch {epoch+1}/{num_epochs}, Train: {train_report},    Val: {val_report}'
             pbar.set_postfix_str(epoch_report)
 
+            # early stopping
+            if stopper is not None:
+                stopper.update_and_save(val_metrics, epoch, self.model, metric=self.stop_metric)
+                if stopper.should_stop:
+                    if stopper.best_state is not None:
+                        self.model.load_state_dict(stopper.best_state) 
+                    break
+
         # test
         self.test_metrics, self.test_values = self._run_phase('eval', loader.test_loader)
 
@@ -247,6 +358,8 @@ class Trainer():
         if torch.cuda.is_available(): torch.cuda.synchronize()
         time_end = time.perf_counter()
         self.test_metrics['time'] = time_end - time_start
+        self.test_metrics['num_epochs'] = epoch
+        self.test_metrics['best_epoch'] = stopper.best_epoch if (stopper is not None) else None
 
         # print test report
         self.test_report = self._generate_report(self.test_metrics, report_metrics)
@@ -714,3 +827,19 @@ def grid(obj, *, prefix:str|None=None, suffix:str|None=None, **param_lists):
 
     return objs
 
+def kwarg_grid(**param_lists):
+    # get keys
+    keys = param_lists.keys()
+
+    # init list
+    param_grid = []
+
+    # for each value combination
+    for values in itertools.product(*param_lists.values()):
+        # get params
+        params = dict(zip(keys, values))
+        
+        # append to list 
+        param_grid.append(params)
+
+    return param_grid

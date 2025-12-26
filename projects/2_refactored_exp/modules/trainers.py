@@ -1,4 +1,4 @@
-from .loss import LossWrapper
+from .loss import LossWrapper, KLDLoss
 from .math import library_size
 from .norm import Normalizer
 from .train import Loader, Trainer
@@ -16,22 +16,28 @@ class ClassifTrainer(Trainer):
     def __init__(
         self,
         lr: float, 
-        pos_keys: str | list[str] = None, # defaults to ('y_logits','y')
-        out_keys: str | list[str] | dict[str,str] | None = 'y_logits',
-        batch_keys: str | list[str] | dict[str,str] | None = 'y',
+        pos_keys: str | list[str] | None = None,
+        out_keys: str | list[str] | dict[str,str] | None = None, # {'input':'y_logits'}
+        batch_keys: str | list[str] | dict[str,str] | None = None, # {'target':'y'}
         loss_class: type[nn.Module] | None = nn.CrossEntropyLoss,
         loss_kwargs: dict | None = None,
         optim_class: type[optim.Optimizer] = optim.Adam, 
         optim_kwargs: dict | None = None,
+        early_stop: bool = False,
+        stop_metric: str = 'loss',
+        stop_kwargs: dict | None = None,
         *,
         weight_method: Literal['none', 'balanced'] = 'balanced',
     ): 
         # set defaults
-        pos_keys = ('y_logits','y') if pos_keys is None else pos_keys
+        out_keys = {'input':'y_logits'} if out_keys is None else out_keys
+        out_keys.update({'batch_size':'batch_size', 'num_nodes':'num_nodes'}) # multiloss compatibility
+        batch_keys = {'target':'y'} if batch_keys is None else batch_keys
 
         # init
         super().__init__(
             lr, pos_keys, out_keys, batch_keys, loss_class, loss_kwargs, optim_class, optim_kwargs, 
+            early_stop=early_stop, stop_metric=stop_metric, stop_kwargs=stop_kwargs,
             weight_method=weight_method
         )
 
@@ -68,12 +74,12 @@ class ClassifTrainer(Trainer):
     
     def _compute_metrics(self, batch_log):
         # get keys
-        preds_key = self.loss_fn.extra_keys[self.pos_keys[0]]
-        target_key = self.loss_fn.extra_keys[self.pos_keys[1]]
+        pred_key = self.loss_fn.extra_keys.get('input')
+        target_key = self.loss_fn.extra_keys.get('target')
 
         # get data
         sample_id = torch.cat([batch['sample_id'] for batch in batch_log['data']])
-        y_logits = torch.cat([batch[preds_key] for batch in batch_log['data']])
+        y_logits = torch.cat([batch[pred_key] for batch in batch_log['data']])
         y = torch.cat([batch[target_key] for batch in batch_log['data']])
 
         # compute metrics
@@ -96,7 +102,7 @@ class ClassifTrainer(Trainer):
         # get values
         values = {
             'sample_id': sample_id.cpu().numpy(),
-            preds_key: y_logits.cpu().numpy(),
+            pred_key: y_logits.cpu().numpy(),
         }
 
         return metrics, values
@@ -105,73 +111,86 @@ class ReconstrTrainer(Trainer):
     def __init__(
         self,
         lr:float, 
-        pos_keys: str | list[str] = None, # defaults to ('x_preds', 'x_t', 'x')
-        out_keys: str | list[str] | dict[str,str] | None = ('x_preds', 'x_t'), # both from model (transformed for loss)
-        batch_keys: str | list[str] | dict[str,str] | None = 'x',
+        pos_keys: str | list[str] | None = None, 
+        out_keys: str | list[str] | dict[str,str] | None = None, # x_t_pred, x_t, x_pred (raw)
+        batch_keys: str | list[str] | dict[str,str] | None = None, # x (raw)
         loss_class: type[nn.Module] | None = nn.MSELoss,
         loss_kwargs: dict | None = None,
         optim_class: type[optim.Optimizer] = optim.Adam, 
         optim_kwargs: dict | None = None,
+        early_stop: bool = False,
+        stop_metric: str = 'loss',
+        stop_kwargs: dict | None = None,
         *,
-        norm_class: type[Normalizer] = Normalizer,
-        norm_kwargs: dict | None = None,
-        target_key: str = 'x', # to get 'x' out of batch for metrics
+        trainer_norm_class: type[Normalizer] = Normalizer,
+        trainer_norm_kwargs: dict | None = None,
     ):
         # set defaults
-        pos_keys = ('x_preds','x_t') if pos_keys is None else pos_keys
-        norm_kwargs = {} if norm_kwargs is None else norm_kwargs
+        out_keys = {'input':'x_t_pred', 'target':'x_t'} if out_keys is None else out_keys # 'x_pred':'x_pred'
+        out_keys.update({'batch_size':'batch_size', 'num_nodes':'num_nodes'}) # multiloss compatibility
+        batch_keys = {'x':'x'} if batch_keys is None else batch_keys
+        trainer_norm_kwargs = {} if trainer_norm_kwargs is None else trainer_norm_kwargs
         
         # init
         super().__init__(
             lr, pos_keys, out_keys, batch_keys, loss_class, loss_kwargs, optim_class, optim_kwargs,
-            norm_class=norm_class, norm_kwargs=norm_kwargs, target_key=target_key
+            early_stop=early_stop, stop_metric=stop_metric, stop_kwargs=stop_kwargs,
+            trainer_norm_class=trainer_norm_class, trainer_norm_kwargs=trainer_norm_kwargs
         )
 
         # save to self
-        self.norm_class = norm_class
-        self.norm_kwargs = norm_kwargs
-        self.target_key = target_key
+        self.trainer_norm_class = trainer_norm_class
+        self.trainer_norm_kwargs = trainer_norm_kwargs
         
     def _init_with_loader(self, loader:Loader):
         super()._init_with_loader(loader) # init self.loss_fn
-        self.norm: Normalizer = self.norm_class(**self.norm_kwargs)
+        self.norm: Normalizer = self.trainer_norm_class(**self.trainer_norm_kwargs)
         self.norm.init_with_loader(loader)
 
     def _compute_metrics(self, batch_log):
         # get keys
-        preds_key = self.loss_fn.extra_keys[self.pos_keys[0]] # x_preds (model space)
-        target_key = self.loss_fn.extra_keys[self.target_key] # x (raw)
+        pred_key = self.loss_fn.extra_keys.get('input') # x_t_pred (model space)
+        target_key = self.loss_fn.extra_keys.get('x') # x (raw)
+
+        # vae
+        mu_key = self.loss_fn.extra_keys.get('mu', None) # z_mu (VAE latent)
+        logvar_key = self.loss_fn.extra_keys.get('logvar', None) # z_logvar (VAE latent)
+        first_mu = batch_log['data'][0].get(mu_key) # use to check if VAE
 
         # get data (in model transform space)
         sample_id = torch.cat([batch['sample_id'] for batch in batch_log['data']])
-        x_preds = torch.cat([batch[preds_key] for batch in batch_log['data']])
+        x_pred = torch.cat([batch[pred_key] for batch in batch_log['data']])
         x = torch.cat([batch[target_key] for batch in batch_log['data']])
+
+        if first_mu is not None:
+            mu = torch.cat([batch[mu_key] for batch in batch_log['data']])
+            logvar = torch.cat([batch[logvar_key] for batch in batch_log['data']])
 
         # model space -> raw space
         libsize = library_size(x, num_nodes=self.model.dims.num_nodes, num_features=self.model.dims.num_node_features)
-        x_preds_raw: Tensor = self.model.encoder.norm.inverse_transform(x_preds, libsize=libsize).detach()
+        x_pred_raw: Tensor = self.model.encoder.norm.inverse_transform(x_pred, libsize=libsize).detach()
 
-        # raw space -> trainer space
-        x_preds = self.norm.transform(x_preds_raw)
-        x = self.norm.transform(x)
-
-        # flatten for metrics
-        x_preds = x_preds.view(-1)
-        x = x.view(-1)
+        # raw space -> trainer space -> flatten for metrics
+        x_pred = self.norm.transform(x_pred_raw).view(-1)
+        x = self.norm.transform(x).view(-1)
 
         # compute metrics
         metrics = {}
-        mse = mean_squared_error(x_preds, x)
+        mse = mean_squared_error(x_pred, x)
         metrics['loss'] = batch_log['loss']/batch_log['num_batches']
         metrics['mse'] = mse.item()
         metrics['rmse'] = mse.sqrt().item()
-        metrics['mae'] = mean_absolute_error(x_preds, x).item()
-        metrics['r2'] = r2_score(x_preds, x).item()
+        metrics['mae'] = mean_absolute_error(x_pred, x).item()
+        metrics['r2'] = r2_score(x_pred, x).item()
+
+        if first_mu is not None:
+            kld_fn = KLDLoss()
+            metrics['kld'] = kld_fn(mu, logvar).item()
 
         # get values
         values = {
             'sample_id': sample_id.cpu().numpy(),
-            f'{preds_key}_raw': x_preds_raw.cpu().numpy(), # raw space
+            f'{pred_key}': x_pred_raw.cpu().numpy(), # raw space
         }
 
         return metrics, values

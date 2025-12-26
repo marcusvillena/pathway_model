@@ -30,6 +30,36 @@ from sklearn.manifold import TSNE
 from torch_geometric.loader import DataLoader
 from typing import Literal
 
+
+# test summary
+from scipy import stats
+def test_summary(df:pd.DataFrame, save_csv:bool=False, filename:str|Path='summary.csv'):
+
+    if isinstance(filename, str):
+        filename = Path(filename)
+
+    # mean, std, ci if trials > 1
+    if df['trial'].max() > 0:
+        # ci helper fxn
+        def _get_ci(series:pd.Series, confidence:float=0.95):
+            n = series.count()
+            sem = stats.sem(series, nan_policy='omit')
+            ci = sem * stats.t.ppf((1 + confidence) / 2., n - 1)
+            return ci
+
+        # group df, get summary stats
+        summary_df = df.groupby(['config','metric'])['value'].agg(mean='mean', sd='std', ci=_get_ci).reset_index()
+
+    # 1 trial only, std and ci can't be calculated
+    else:
+        summary_df = df.groupby(['config','metric'])['value'].agg(mean='mean').reset_index()
+
+    # save csv
+    if save_csv:
+        summary_df.to_csv(filename, index=False)
+
+    return summary_df
+
 ## Grid Expt viz
 class ConfigLookup(): # requires json
     def __init__(self, keys:list[str], path:str|Path, configs:list|pd.Series|None=None, use_keypath:bool=False, save:bool=False):
@@ -50,14 +80,14 @@ class ConfigLookup(): # requires json
         # get keypaths from first config
         with open(path / configs[0] / f'{configs[0]}_params.json') as f:
             d = json.load(f)
-        keypaths = self.find_keypaths(keys, d)
+        self.keypaths = self.find_keypaths(keys, d)
 
         # get values using keypaths
         self.data = []
         for config in configs:
             with open(path / config / f'{config}_params.json') as f:
                 j = json.load(f)
-            d = self.path_to_dict(keypaths, j, use_keypath)
+            d = self.path_to_dict(self.keypaths, j, use_keypath)
             d['config'] = config
             self.data.append(d)
 
@@ -80,6 +110,7 @@ class ConfigLookup(): # requires json
         if isinstance(d, dict):
             iterator = d.items()
         elif isinstance(d, list):
+            out[parent] = d
             iterator = enumerate(d)
         else:
             out[parent] = d
@@ -307,7 +338,7 @@ def devplot(
                     y = test_mean,
                     s = test_label,
                     va = 'center',
-                    ha = 'right',
+                    ha = 'left',
                     color = 'green',
                     bbox = dict(boxstyle='round,pad=0.2', facecolor='white', edgecolor='green', alpha=0.9)
                 )

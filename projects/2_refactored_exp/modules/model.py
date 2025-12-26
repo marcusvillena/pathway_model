@@ -105,7 +105,8 @@ class Encoder(nn.Module):
         data['x'] = data['x'].float() 
 
         # transform x to norm
-        data['x'] = self.norm.transform(data['x'])
+        data['libsize'] = self.norm.get_libsize(data['x'])
+        data['x'] = self.norm.transform(data['x'], libsize=data['libsize'])
 
         return data
 
@@ -168,6 +169,9 @@ class Encoder(nn.Module):
         out = {}
         out['x'] = x
         out['x_t'] = x_t
+        out['libsize'] = data.get('libsize', None)
+        out['batch_size'] = h_node.shape[0]
+        out['num_nodes'] = h_node.shape[1]
         # out['mu'] = data.get('mu') # nbloss
         # out['theta'] = data.get('theta') # nbloss
 
@@ -466,8 +470,8 @@ class BaseClassifier(BaseModel):
         # format output
         del data['x'] # avoid overlap with batch dict
         data['y_logits'] = x
-        data['y_probs'] = x.softmax(dim=-1)
-        data['y_preds'] = x.argmax(dim=-1)
+        data['y_prob'] = x.softmax(dim=-1)
+        data['y_pred'] = x.argmax(dim=-1)
         if need_weights:
             data['layer_outs']['clf'] = out
         return data
@@ -514,10 +518,18 @@ class BaseAutoencoder(BaseModel):
 
     def forward(self, input:Union[Data, Tensor, dict], need_weights:bool=False):
         x, out, data = super().forward(input, need_weights)
-        
+
+        # # ensure x is >= 0, e.g. predict raw counts
+        # x = nn.functional.softplus(x)
+        # data['x_pred'] = x.view(self.encoder.orig_shape)
+
+        # # convert to model space (for loss computation)
+        # libsize = data.get('libsize', None)
+        # x = self.encoder.norm.transform(x, libsize=libsize)
+        data['x_t_pred'] = x.view(self.encoder.orig_shape)
+
         # format output
         del data['x'] # avoid overlap with batch dict
-        data['x_preds'] = x.view(self.encoder.orig_shape)
         if need_weights:
             data['layer_outs']['dec'] = out
         return data

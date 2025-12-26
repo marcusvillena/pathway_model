@@ -4,6 +4,7 @@ from .math import (
     z_inv_transform,
     nbvst_transform,
     nbvst_inv_transform,
+    library_size,
     libnorm_transform,
     libnorm_inv_transform,
     nb_theta,
@@ -89,14 +90,21 @@ class Normalizer(nn.Module):
             self.register_buffer('pi', loader.stats['pi'])
             self.register_buffer('libscale', libscale)
 
-    def transform(self, x:Tensor) -> Tensor:
+    def get_libsize(self, x:Tensor) -> Tensor:
+        if self.libnorm:
+            self._check_initialized()
+            return library_size(x, num_nodes=self.num_nodes, num_features=self.num_features)
+        else:
+            return None
+
+    def transform(self, x:Tensor, libsize:float|None=None) -> Tensor:
         x, orig_shape = self._reshape_and_record(x)
 
         if self.libnorm or self.znorm:
             self._check_initialized()
 
         if self.libnorm:
-            x = libnorm_transform(x, libscale=self.libscale)
+            x = libnorm_transform(x, libsize=libsize, libscale=self.libscale)
 
         # for child class, transform should happen here
 
@@ -131,16 +139,17 @@ class LogCounts(Normalizer):
     def init_with_loader(self, loader:Loader, transform:Callable=torch.log1p):
         super().init_with_loader(loader, transform)
 
-    def transform(self, x:Tensor) -> Tensor:
+    def transform(self, x:Tensor, libsize:float|None=None) -> Tensor:
         x, orig_shape = self._reshape_and_record(x)
 
         if self.libnorm or self.znorm:
             self._check_initialized()
 
         if self.libnorm:
-            x = libnorm_transform(x, libscale=self.libscale)
+            x = libnorm_transform(x, libsize=libsize, libscale=self.libscale)
 
         # x -> log(x)
+        x = torch.clamp(x, min=self.eps)  # avoid log(0)
         x = torch.log1p(x)
 
         if self.znorm:
@@ -158,7 +167,8 @@ class LogCounts(Normalizer):
             x = z_inv_transform(x, self.mean, self.std)
 
         # log(x) -> x
-        x = torch.expm1(x) 
+        x = torch.expm1(x)
+        x = torch.clamp(x, min=0.0)  # avoid negative counts
 
         if self.libnorm and libsize is not None:
             x = libnorm_inv_transform(x, libsize=libsize, libscale=self.libscale)
@@ -171,12 +181,12 @@ class NBVST(Normalizer):
         theta = loader.stats['theta']
         super().init_with_loader(loader, transform, theta=theta)
 
-    def transform(self, x:Tensor) -> Tensor:
+    def transform(self, x:Tensor, libsize:float|None=None) -> Tensor:
         self._check_initialized() # theta must exist
         x, orig_shape = self._reshape_and_record(x)            
 
         if self.libnorm:
-            x = libnorm_transform(x, libscale=self.libscale)
+            x = libnorm_transform(x, libsize=libsize, libscale=self.libscale)
 
         # NB VST
         x = nbvst_transform(x, self.theta)

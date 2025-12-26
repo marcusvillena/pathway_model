@@ -1,5 +1,60 @@
 import torch
+import numpy as np
 from torch import Tensor
+from .utils import assert_finite, assert_nonnegative
+
+## trainer
+class ExpMovingAverage():
+    def __init__(self, alpha: float = 0.9, warmup: int = 0, eps: float = 1e-8) -> None:
+        self.target_alpha = float(alpha)
+        self.warmup = int(warmup)
+        self.eps = float(eps)
+
+        # trackers
+        self.epoch = 0
+        self.mean: float|None = None
+        self.var: float|None = None
+
+    @property
+    def alpha(self) -> float:
+        if self.warmup <= 0:
+            return self.target_alpha
+        if self.epoch < self.warmup:
+            return self.target_alpha * (self.epoch + 1) / self.warmup
+        return self.target_alpha
+    
+    @property
+    def n_eff(self) -> float:
+        return (1 + self.alpha) / max(1 - self.alpha, self.eps)
+    
+    def moe(self, z:float=1.96) -> float|None:
+        if self.var is None:
+            return None
+        return z * np.sqrt(self.var / self.n_eff)
+    
+    def update(self, x:float|torch.Tensor) -> None:
+        # convert to float
+        if torch.is_tensor(x):
+            x = x.detach().item()
+        x = float(x)
+
+        # initialize ema if None
+        if self.mean is None:
+            self.mean = x
+            self.var = 0.0
+
+        # update ema
+        else:
+            alpha = self.alpha
+            mean_prev = self.mean
+
+            self.mean = alpha * self.mean + (1 - alpha) * x
+            self.var = alpha * self.var + (1 - alpha) * (x - self.mean) * (x - mean_prev)
+            self.var = max(self.var, 0.0)  # ensure non-negative variance
+
+        self.epoch += 1
+        return self.mean, self.var
+    
 
 ## libsize
 def library_size(x:Tensor, count_idx:int=0, num_nodes:int|None=None, num_features:int|None=None):
@@ -8,15 +63,20 @@ def library_size(x:Tensor, count_idx:int=0, num_nodes:int|None=None, num_feature
         x = x.view(-1, num_nodes, num_features)
 
     # else assumes x is in (b,n,f)
-    return x[:, :, count_idx].sum(dim=1) # (b,)
+    libsize = x[:, :, count_idx].sum(dim=1) # (b,)
 
-def libnorm_transform(x:Tensor, libscale:float=1.0, eps:float=1e-8):
-    libsize = library_size(x).view(-1,1,1) # (b,1,1)
+    return libsize
+
+def libnorm_transform(x:Tensor, libsize:Tensor|None=None, libscale:float=1.0, eps:float=1e-8):
+    if libsize is None:
+        libsize = library_size(x)
+    libsize = libsize.view(-1,1,1) # ensure (b,1,1)
     return x / torch.clamp(libsize, min=eps) * libscale
 
 def libnorm_inv_transform(x:Tensor, libsize:Tensor, libscale:float=1.0, eps:float=1e-8):
     libsize = libsize.view(-1,1,1)  # ensure (b,1,1)
-    return x * libsize / torch.clamp(libscale, min=eps)
+    out = x * libsize / torch.clamp(libscale, min=eps)
+    return out
 
 ## standardize (Z-score)
 def z_transform(x:Tensor, mean:Tensor, std:Tensor, eps:float=1e-8) -> Tensor:

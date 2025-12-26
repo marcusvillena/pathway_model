@@ -19,6 +19,21 @@ from torch import Tensor
 from torch_geometric.data import Batch, Data
 from typing import Callable, Literal, Optional, Type, Union
 
+
+# errors/sanity
+def assert_finite(x:Tensor, name:str):
+    if not torch.isfinite(x).all():
+        num_bad = (~torch.isfinite(x)).sum().item()
+        _min = x.min().item() if x.numel() else float('nan')
+        _max = x.max().item() if x.numel() else float('nan')
+        raise ValueError(f'{name} contains {num_bad} non-finite values (min={_min}, max={_max})')
+
+def assert_nonnegative(x:Tensor, name:str):
+    assert_finite(x, name)
+    if (x < 0).any():
+        _min = x.min().item()
+        raise ValueError(f'{name} contains negative values (min={_min})')
+
 # math
 def tsoftmax(input:Tensor, temperature:float=1, dim:int=None, dtype:Optional[torch.dtype]=None):
     if temperature is None:
