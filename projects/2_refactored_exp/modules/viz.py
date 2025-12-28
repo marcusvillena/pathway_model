@@ -3,6 +3,8 @@ from pathlib import Path
 from statannotations.Annotator import Annotator
 import itertools
 import json
+from scipy import stats
+import shutil
 
 ##
 
@@ -27,12 +29,13 @@ from sklearn.metrics import mean_absolute_error
 from sklearn.decomposition import PCA
 from sklearn.manifold import TSNE
 
+# typing
+from pandas import DataFrame
 from torch_geometric.loader import DataLoader
 from typing import Literal
 
 
-# test summary
-from scipy import stats
+# summary stats
 def test_summary(df:pd.DataFrame, save_csv:bool=False, filename:str|Path='summary.csv'):
 
     if isinstance(filename, str):
@@ -60,51 +63,68 @@ def test_summary(df:pd.DataFrame, save_csv:bool=False, filename:str|Path='summar
 
     return summary_df
 
-## Grid Expt viz
 class ConfigLookup(): # requires json
-    def __init__(self, keys:list[str], path:str|Path, configs:list|pd.Series|None=None, use_keypath:bool=False, save:bool=False):
+    def __init__(self, *, keys:str|list[str]|None=None, path:str|Path|None=None, **kwargs):
+        if keys is None:
+            return
+        
+        if path is not None:
+            self.from_expt_folder(keys=keys, path=path, **kwargs)
+            return 
+        
+        if 'filepaths' in kwargs:
+            filepaths = kwargs["filepaths"]
+            use_keypath = kwargs.get("use_keypath", False)
+            self.from_filepaths(keys=keys, filepaths=filepaths, use_keypath=use_keypath)
+        
+    def from_expt_folder(self, keys:list[str], path:str|Path, configs:str|list[str]|None=None, use_keypath:bool=False, save:bool=False):
         path = Path(path)
-
-        # config fallback: use all from summary
+        
+        # config fallback: use all from test.csv
         if configs is None:
-            configs = pd.read_csv(path/'summary.csv')['config'].unique().tolist()
-            
-        # ensure list
-        if not isinstance(keys, list): 
-            keys = [keys]
-        if isinstance(configs, pd.Series):
-            configs = list(configs)
-        elif not isinstance(configs, list):
-            configs = [configs]
+            configs = pd.read_csv(path/'test.csv')['config'].unique().tolist()
+        configs: list[str] = configs if isinstance(configs, list) else [configs]
+
+        # get filepaths
+        filepaths: list[Path] = [path / config / f'{config}_params.json' for config in configs]
+
+        # run lookup
+        self.from_filepaths(keys, filepaths, use_keypath=use_keypath)
+
+        # save
+        name = '_'.join([clean_name(i) for i in self.keys])
+        self.data.to_csv(path / f'{name}_conf.csv', index=False)
+
+    def from_filepaths(self, keys: str | list[str], filepaths: str | Path | list[str|Path], use_keypath:bool=False):
+        # ensure types
+        self.keys = keys if isinstance(keys, list) else [keys]
+        self.filepaths = filepaths if isinstance(filepaths, list) else [filepaths]
+        self.filepaths:list[Path] = [Path(i) for i in self.filepaths]
+
+        if not self.filepaths:
+            raise ValueError("No filepaths provided to ConfigLookup.")
 
         # get keypaths from first config
-        with open(path / configs[0] / f'{configs[0]}_params.json') as f:
+        with open(self.filepaths[0]) as f:
             d = json.load(f)
-        self.keypaths = self.find_keypaths(keys, d)
+        self.keypaths = self._find_keypaths(self.keys, d)
 
         # get values using keypaths
         self.data = []
-        for config in configs:
-            with open(path / config / f'{config}_params.json') as f:
+        for filepath in self.filepaths:
+            with open(filepath) as f:
                 j = json.load(f)
-            d = self.path_to_dict(self.keypaths, j, use_keypath)
-            d['config'] = config
+            d = self._path_to_dict(self.keypaths, j, use_keypath)
+
+            # get config name
+            stem = filepath.stem
+            d["config"] = stem[:-len('_params')] if stem.endswith('_params') else stem
             self.data.append(d)
 
         # convert to dataframe
         self.data = pd.DataFrame(self.data)
 
-        # save to csv
-        self.keys = keys
-        self.path = path
-        if save:
-            self.save()
-
-    def save(self):
-        name = '_'.join([clean_name(i) for i in self.keys])
-        self.data.to_csv(self.path / f'{name}_conf.csv', index=False)
-
-    def flatten_dict(self, d:dict, parent=()):
+    def _flatten_dict(self, d:dict, parent=()):
         out = {}
 
         if isinstance(d, dict):
@@ -119,17 +139,17 @@ class ConfigLookup(): # requires json
         for k, v in iterator:
             path = parent + (k,)
             if isinstance(v, (dict, list)):
-                out.update(self.flatten_dict(v, path))
+                out.update(self._flatten_dict(v, path))
             else:
                 out[path] = v
 
         return out
 
-    def find_keypaths(self, find, d):
+    def _find_keypaths(self, find, d):
         if not isinstance(find, list):
             find = [find]
 
-        flat = self.flatten_dict(d)
+        flat = self._flatten_dict(d)
 
         # index by final key
         index = {}
@@ -144,7 +164,7 @@ class ConfigLookup(): # requires json
 
         return result
 
-    def path_to_dict(self, keypaths, d, use_keypath:bool=False):
+    def _path_to_dict(self, keypaths, d, use_keypath:bool=False):
         out = {}
 
         for keypath in keypaths:
@@ -164,6 +184,130 @@ class ConfigLookup(): # requires json
 
         return out
 
+class MultiExperiment():
+    def __init__(
+        self,
+        experiment_dirs: str | Path | list[str|Path],
+        keys: str | list[str],
+        out_dir: str | Path = './experiments',
+        copy_files: bool = False,
+        use_keypath: bool = False,
+        overwrite: bool = False
+    ):
+        self.keys = keys if isinstance(keys, list) else [keys]
+        self.out_dir = Path(out_dir)
+        self.overwrite = overwrite
+        self.avoided_overwrite: list = []
+
+        # make output directory
+        self.out_dir.mkdir(parents=True, exist_ok=True)
+
+        # ensure list and paths are children of parent
+        if not isinstance(experiment_dirs, list):
+            experiment_dirs = [experiment_dirs]
+        self.experiment_dirs = [Path(exp_dir) for exp_dir in experiment_dirs]
+
+        # merge devtest csvs
+        self.dev: DataFrame = self._merge_devtests('dev.csv')
+        self.test: DataFrame = self._merge_devtests('test.csv')
+        self.summary: DataFrame = test_summary(self.test)
+
+        # copy config files
+        self.config_names: list[str] = self.test['config'].unique().tolist()
+        self._copy_config_files()
+
+        # copy experiment files
+        if copy_files:
+            self._copy_expt_files()
+
+        # get configs
+        self.config_lookup = ConfigLookup(
+            keys=self.keys,
+            filepaths=[self.config_dir / f'{name}_params.json' for name in self.config_names],
+            use_keypath=use_keypath,
+        )
+        self.configs = self.config_lookup.data
+
+        # save csvs
+        self.dev = self._save_csv(self.dev, 'dev.csv')
+        self.test = self._save_csv(self.test, 'test.csv')
+        self.summary = self._save_csv(self.summary, 'summary.csv')
+        self.configs = self._save_csv(self.configs, 'configs.csv')
+
+        # print overwrite msg
+        if self.avoided_overwrite:
+            print(f'Avoided overwriting {len(self.avoided_overwrite)} files. Call self.avoided_overwrite to see list, or run with overwrite=True to overwrite.')
+            
+    def _merge_devtests(self, file: str) -> DataFrame:
+        expt_dfs: list[DataFrame] = []
+        old_max = -1 # start at -1 + 1 = 0
+
+        for expt_dir in self.experiment_dirs:
+            df = pd.read_csv(expt_dir/file)
+
+            # align trials
+            new_min =  df['trial'].min() # min of current expt
+            shift = (old_max + 1) - new_min # shift to align with old max + 1
+            df['trial'] += shift # shift trials to start after old max
+            old_max = df['trial'].max() # update old max for next expt
+
+            expt_dfs.append(df)
+
+        return pd.concat(expt_dfs, ignore_index=True)
+    
+    def _copy_fn(self, src: str, dst: str) -> str:
+        if not Path(dst).exists() or self.overwrite:
+            return shutil.copy2(src, dst)
+        else:
+            self.avoided_overwrite.append(str(dst))
+            return dst
+        
+    def _copy_config_files(self):
+        # make config directory
+        self.config_dir = self.out_dir / 'configs'
+        self.config_dir.mkdir(parents=True, exist_ok=True)    
+
+        # copy config _params.json files, once per config
+        for config in self.config_names:
+            for expt in self.experiment_dirs:
+                src = expt / config / f'{config}_params.json'
+                if src.exists(): # if config in expt
+                    dst = self.config_dir / f'{config}_params.json'
+                    self._copy_fn(src, dst)
+                    break
+
+    def _copy_expt_files(self):
+        # make file directory
+        self.file_dir = self.out_dir / 'files'
+        self.file_dir.mkdir(parents=True, exist_ok=True)
+
+        # copy expt files into file directory
+        for expt in self.experiment_dirs:
+            expt = expt.resolve()
+            if not expt.is_dir():
+                continue # skip non-directories
+
+            shutil.copytree(
+                src=str(expt),
+                dst=str(self.file_dir / expt.name),
+                dirs_exist_ok=True,
+                copy_function=self._copy_fn
+            )
+
+    def _save_csv(self, df: DataFrame, filename: str,  merge:bool=True):
+        if merge and filename != 'configs.csv':
+            df = pd.merge(self.configs, df, on='config')
+
+        out_path = self.out_dir / filename
+        
+        if not out_path.exists() or self.overwrite:
+            df.to_csv(out_path, index=False)
+        else:
+            self.avoided_overwrite.append(str(out_path))
+
+        return df
+
+# grid experiment plots
 def metric_x_point(
     # data
     df:pd.DataFrame, cols:list[str], metrics:list[str]|None=None, filters:dict|None=None, 

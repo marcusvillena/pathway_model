@@ -31,8 +31,15 @@ class ClassifTrainer(Trainer):
     ): 
         # set defaults
         out_keys = {'input':'y_logits'} if out_keys is None else out_keys
-        out_keys.update({'batch_size':'batch_size', 'num_nodes':'num_nodes'}) # multiloss compatibility
         batch_keys = {'target':'y'} if batch_keys is None else batch_keys
+
+        # multiloss compatibility
+        if isinstance(out_keys, str):
+            out_keys = {out_keys:out_keys}
+        if isinstance(out_keys, (list, tuple, set)):
+            out_keys = {key:key for key in out_keys}
+        if isinstance(out_keys, dict):
+            out_keys.update({'batch_size':'batch_size', 'num_nodes':'num_nodes'})
 
         # init
         super().__init__(
@@ -122,23 +129,39 @@ class ReconstrTrainer(Trainer):
         stop_metric: str = 'loss',
         stop_kwargs: dict | None = None,
         *,
+        metric_keys: str | list[str] | dict[str,str] | None = None,
         trainer_norm_class: type[Normalizer] = Normalizer,
         trainer_norm_kwargs: dict | None = None,
     ):
         # set defaults
         out_keys = {'input':'x_t_pred', 'target':'x_t'} if out_keys is None else out_keys # 'x_pred':'x_pred'
-        out_keys.update({'batch_size':'batch_size', 'num_nodes':'num_nodes'}) # multiloss compatibility
         batch_keys = {'x':'x'} if batch_keys is None else batch_keys
+        metric_keys = {'pred':'input', 'target':'x'} if metric_keys is None else metric_keys
         trainer_norm_kwargs = {} if trainer_norm_kwargs is None else trainer_norm_kwargs
         
+        # metric keys handling
+        if isinstance(metric_keys, str):
+            metric_keys = {metric_keys:metric_keys}
+        if isinstance(metric_keys, (list, tuple, set)):
+            metric_keys = {key:key for key in metric_keys}
+
+        # multiloss compatibility: convert to dict, add batch_size,num_nodes
+        if isinstance(out_keys, str):
+            out_keys = {out_keys:out_keys}
+        if isinstance(out_keys, (list, tuple, set)):
+            out_keys = {key:key for key in out_keys}
+        if isinstance(out_keys, dict):
+            out_keys.update({'batch_size':'batch_size', 'num_nodes':'num_nodes'})
+
         # init
         super().__init__(
             lr, pos_keys, out_keys, batch_keys, loss_class, loss_kwargs, optim_class, optim_kwargs,
             early_stop=early_stop, stop_metric=stop_metric, stop_kwargs=stop_kwargs,
-            trainer_norm_class=trainer_norm_class, trainer_norm_kwargs=trainer_norm_kwargs
+            metric_keys=metric_keys, trainer_norm_class=trainer_norm_class, trainer_norm_kwargs=trainer_norm_kwargs
         )
 
         # save to self
+        self.metric_keys = metric_keys
         self.trainer_norm_class = trainer_norm_class
         self.trainer_norm_kwargs = trainer_norm_kwargs
         
@@ -147,24 +170,22 @@ class ReconstrTrainer(Trainer):
         self.norm: Normalizer = self.trainer_norm_class(**self.trainer_norm_kwargs)
         self.norm.init_with_loader(loader)
 
+    def _metric_key(self, key:str) -> str:
+        metric_key = self.metric_keys.get(key)
+        if metric_key is not None:
+            return self.loss_fn.extra_keys.get(metric_key)
+        else:
+            return self.loss_fn.extra_keys.get(key)
+
     def _compute_metrics(self, batch_log):
         # get keys
-        pred_key = self.loss_fn.extra_keys.get('input') # x_t_pred (model space)
-        target_key = self.loss_fn.extra_keys.get('x') # x (raw)
-
-        # vae
-        mu_key = self.loss_fn.extra_keys.get('mu', None) # z_mu (VAE latent)
-        logvar_key = self.loss_fn.extra_keys.get('logvar', None) # z_logvar (VAE latent)
-        first_mu = batch_log['data'][0].get(mu_key) # use to check if VAE
+        pred_key = self._metric_key('pred') # x_t_pred (model space)
+        target_key = self._metric_key('target') # x (raw)
 
         # get data (in model transform space)
         sample_id = torch.cat([batch['sample_id'] for batch in batch_log['data']])
         x_pred = torch.cat([batch[pred_key] for batch in batch_log['data']])
         x = torch.cat([batch[target_key] for batch in batch_log['data']])
-
-        if first_mu is not None:
-            mu = torch.cat([batch[mu_key] for batch in batch_log['data']])
-            logvar = torch.cat([batch[logvar_key] for batch in batch_log['data']])
 
         # model space -> raw space
         libsize = library_size(x, num_nodes=self.model.dims.num_nodes, num_features=self.model.dims.num_node_features)
@@ -183,14 +204,19 @@ class ReconstrTrainer(Trainer):
         metrics['mae'] = mean_absolute_error(x_pred, x).item()
         metrics['r2'] = r2_score(x_pred, x).item()
 
-        if first_mu is not None:
-            kld_fn = KLDLoss()
-            metrics['kld'] = kld_fn(mu, logvar).item()
-
         # get values
         values = {
             'sample_id': sample_id.cpu().numpy(),
             f'{pred_key}': x_pred_raw.cpu().numpy(), # raw space
         }
+
+        # VAE metrics
+        z_mu_key = self._metric_key('z_mu') # z_mu (VAE latent)
+        is_vae = (batch_log['data'][0].get(z_mu_key) is not None) # use to check if VAE
+        if is_vae:
+            z_logvar_key = self._metric_key('z_logvar') # z_logvar (VAE latent)
+            z_mu = torch.cat([batch[z_mu_key] for batch in batch_log['data']])
+            z_logvar = torch.cat([batch[z_logvar_key] for batch in batch_log['data']])
+            metrics['kld'] = KLDLoss()(z_mu, z_logvar).item()
 
         return metrics, values

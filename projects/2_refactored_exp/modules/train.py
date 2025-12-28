@@ -27,6 +27,7 @@ import numpy as np
 
 # grid 
 import itertools
+import functools
 
 # typing
 from .data import DataWrapper
@@ -242,7 +243,6 @@ class EarlyStopping():
                 k: v.detach().cpu().clone() 
                 for k, v in model.state_dict().items()
             }
-
 
 class Trainer():
     def __init__(
@@ -792,24 +792,48 @@ class Experiment():
             with open(self.folder / f'params.json', 'w') as f:
                 json.dump(params, f, indent=4, default=str)
 
-def grid(obj, *, prefix:str|None=None, suffix:str|None=None, **param_lists):
-    # init model dict
-    objs = {}
+def grid(obj, *, prefix:str|None=None, suffix:str|None=None, merge_keys:str|list[str]|None=None, **param_lists):
+    objs = {} # init model dict
+    keys = list(param_lists.keys()) # get keys (each param)
+    
+    # norm merge keys
+    if merge_keys is None:
+        merge_keys = []
+    if not isinstance(merge_keys, list):
+        merge_keys = [merge_keys]
 
-    # get keys (each param)
-    keys = list(param_lists.keys())
+    # unpack if partial !!!
+    if isinstance(obj, functools.partial):
+        base_callable = obj.func
+        base_kwargs = dict(obj.keywords or {})
+        base_args = obj.args or ()
+
+    else:
+        base_callable = obj
+        base_kwargs = {}
+        base_args = ()
 
     # filter kwargs (safe func/class.__init__)
-    obj = filter_kwargs(obj)
+    base_callable = filter_kwargs(base_callable) # originally: obj = filter_kwargs(obj) !!!
 
     # for each value combination
     for values in itertools.product(*param_lists.values()):
         # get params
         params = dict(zip(keys,values))
 
-        # build name
+        # build name (new params only)
         parts = [] 
         for k,v in params.items():
+            if isinstance(v, bool):
+                v = 'T' if v else 'F' # bool as T/F
+            if isinstance(v, dict):
+                for vk, vv in v.items():
+                    ck = clean_name(vk).replace('_','')
+                    cv = clean_name(vv).replace('_','')
+                    cv = cv[:1].upper() + cv[1:] # capitalize first char
+                    parts.append(f'{ck}{cv}')
+                continue
+
             ck = clean_name(k).replace('_','')
             cv = clean_name(v).replace('_','')
             cv = cv[:1].upper() + cv[1:] # capitalize first char
@@ -822,8 +846,14 @@ def grid(obj, *, prefix:str|None=None, suffix:str|None=None, **param_lists):
         if suffix:
             name = f'{name}_{clean_name(suffix)}'
 
+        # merge partial !!!
+        for k in merge_keys:
+            if isinstance(params.get(k), dict) and isinstance(base_kwargs.get(k), dict):
+                params[k] = {**base_kwargs[k], **params[k]} # grid overrides partial
+        merged_kwargs = {**base_kwargs, **params}
+
         # build config name & model
-        objs[name] = obj(**params)
+        objs[name] = base_callable(*base_args, **merged_kwargs) # originally obj(**params) !!!
 
     return objs
 

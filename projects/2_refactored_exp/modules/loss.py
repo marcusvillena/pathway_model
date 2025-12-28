@@ -84,7 +84,7 @@ class MultiLoss(nn.Module):
         self, 
         loss_classes: type[nn.Module] | list[type[nn.Module]],
         loss_weights: list[float] | None = None,
-        loss_inputs: list[dict[str,str] | None] | None = None,
+        loss_inputs: list[str | list[str] | dict[str,str] | None] | None = None,
         reduction: Literal['none','sum','mean'] = 'mean',
         eps: float = 1e-8,
         **kwargs
@@ -129,6 +129,21 @@ class MultiLoss(nn.Module):
         if loss_inputs is None:
             return [None] * self.num_losses
         
+        # ensure list
+        if not isinstance(loss_inputs, list):
+            loss_inputs = [loss_inputs]
+
+        # normalize to mapping (dict)
+        for idx, item in enumerate(loss_inputs):
+            if item is None:
+                continue
+            if isinstance(item, str):
+                loss_inputs[idx] = {item:item}
+            elif isinstance(item, (list,tuple,set)):
+                loss_inputs[idx] = {i:i for i in item}
+            elif not isinstance(item, dict):
+                raise ValueError(f'loss_inputs items must be str, list[str], dict[str,str], or None. Got {type(item)}')
+            
         # ensure dims match
         if len(loss_inputs) != self.num_losses:
             raise RuntimeError(f'Number of loss_inputs ({len(loss_inputs)}) must match number of losses ({self.num_losses})')
@@ -271,8 +286,6 @@ class KLDLoss(nn.Module):
             self.step += 1
 
         return kl
-    
-
 
 class NBLoss(nn.Module):
     def __init__(self, eps:float=1e-8, reduction:Literal['none','sum','mean']='mean', *args, **kwargs):
@@ -299,10 +312,7 @@ class NBLoss(nn.Module):
         )
 
         # reduce
-        if self.reduction == 'mean':
-            log_nb = log_nb.mean()
-        elif self.reduction == 'sum':
-            log_nb = log_nb.sum()
+        log_nb = reduce_loss(log_nb, self.reduction)
 
         return log_nb
     
