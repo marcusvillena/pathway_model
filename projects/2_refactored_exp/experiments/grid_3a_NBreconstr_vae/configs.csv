@@ -1,0 +1,11 @@
+loss_weights,config
+"[1.0, 1.0]",lossweights11
+"[1.0, 0.1]",lossweights10.1
+"[1.0, 0.01]",lossweights10.01
+"[1.0, 0.001]",lossweights11e-3
+"[1.0, 0.0001]",lossweights11e-4
+"[1.0, 1e-05]",lossweights11e-5
+"[1.0, 1e-06]",lossweights11e-6
+"[1.0, 1e-07]",lossweights11e-7
+"[1.0, 1e-08]",lossweights11e-8
+"[1.0, 0.0]",lossweights10

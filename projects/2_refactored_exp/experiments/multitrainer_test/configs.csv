@@ -1,0 +1,5 @@
+method,mlp,config
+node,False,methodNode_mlpF
+node,True,methodNode_mlpT
+set,False,methodSet_mlpF
+set,True,methodSet_mlpT

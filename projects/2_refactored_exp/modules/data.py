@@ -276,7 +276,7 @@ class GraphDataset(InMemoryDataset):
         self.wrapper = DataWrapper(counts_data, edge_data, pathway_data, verbose)
 
         # extract data for graph dataset
-        self.x = self.wrapper.x
+        self.x = self.wrapper.x.to(torch.float)
         self.y = self.wrapper.y
         self.edge_index = self.wrapper.edge_index
         self.edge_attr = self.wrapper.edge_attr

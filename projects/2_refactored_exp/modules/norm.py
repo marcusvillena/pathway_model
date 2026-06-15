@@ -80,15 +80,15 @@ class Normalizer(nn.Module):
         if self.learnable:
             self.mean = nn.Parameter(mean)
             self.std = nn.Parameter(std)
-            self.theta = nn.Parameter(loader.stats['theta'])
-            self.pi = nn.Parameter(loader.stats['pi'])
             self.libscale = nn.Parameter(libscale)
         else:
             self.register_buffer('mean', mean)
             self.register_buffer('std', std)
-            self.register_buffer('theta', loader.stats['theta'])
-            self.register_buffer('pi', loader.stats['pi'])
             self.register_buffer('libscale', libscale)
+
+        # always learnable
+        self.theta = nn.Parameter(loader.stats['theta'])
+        self.pi = nn.Parameter(loader.stats['pi'])
 
     def get_libsize(self, x:Tensor) -> Tensor:
         if self.libnorm:

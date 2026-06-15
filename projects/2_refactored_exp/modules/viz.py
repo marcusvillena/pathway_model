@@ -313,7 +313,7 @@ def metric_x_point(
     df:pd.DataFrame, cols:list[str], metrics:list[str]|None=None, filters:dict|None=None, 
     
     # plot
-    hue:bool=False, strip:bool=False, alpha:float=0.5, figsize:tuple|None=None, dodge:bool=True, 
+    hue:bool=False, strip:bool=False, box:bool=False, alpha:float=0.5, figsize:tuple|None=None, dodge:bool=True, 
 
     # stats
     sig:Literal['within','between']|bool=True, test:str='t-test_ind'
@@ -336,7 +336,10 @@ def metric_x_point(
         fig, ax = plt.subplots(figsize=figsize)
         if strip:
             sns.stripplot(data=data,x=x, y='value', hue=hue_col, ax=ax, alpha=alpha, legend=False, dodge=dodge) #dodge=True)
-        sns.pointplot(data=data, x=x, y='value', hue=hue_col, ax=ax, dodge=dodge_point)
+        if box:
+            sns.boxplot(data=data, x=x, y='value', hue=hue_col, ax=ax, showcaps=False, boxprops={'zorder':2}, whiskerprops={'zorder':2}, dodge=dodge)
+        else:
+            sns.pointplot(data=data, x=x, y='value', hue=hue_col, ax=ax, dodge=dodge_point)
         ax.set_xlabel(x.capitalize())
         ax.set_ylabel(metric.capitalize())
         plt.tight_layout()
@@ -412,6 +415,170 @@ def metric_x_point(
         else:
             for col in cols:
                 mxpointplot(data=filt, x=col, metric=metric, hue_col=None)
+
+def metric_x_point2(
+    df: pd.DataFrame,
+    cols: list[str],
+    metrics: list[str] | None = None,
+    filters: dict | None = None,
+    hue: bool = False,
+    strip: bool = False,
+    box: bool = False,
+    alpha: float = 0.5,
+    figsize: tuple | None = None,
+    dodge: bool = True,
+    sig: Literal['within', 'between'] | bool = True,
+    test: str = 't-test_ind'
+):
+    if filters is None:
+        filters = {}
+
+    metrics = validate_filter(metrics, df['metric'].unique(), 'metrics')
+
+    if not isinstance(cols, list):
+        cols = [cols]
+
+    def mxpointplot(data, x: str, metric: str, hue_col=None):
+        if dodge and hue and hue_col is not None:
+            dodge_point = 0.8 - 0.8 / len(data[hue_col].dropna().unique())
+        else:
+            dodge_point = False
+
+        fig, ax = plt.subplots(figsize=figsize)
+
+        if strip:
+            sns.stripplot(
+                data=data,
+                x=x,
+                y='value',
+                hue=hue_col,
+                ax=ax,
+                alpha=alpha,
+                legend=False,
+                dodge=dodge
+            )
+
+        if box:
+            sns.boxplot(
+                data=data,
+                x=x,
+                y='value',
+                hue=hue_col,
+                ax=ax,
+                showcaps=False,
+                boxprops={'zorder': 2},
+                whiskerprops={'zorder': 2},
+                dodge=dodge
+            )
+        else:
+            sns.pointplot(
+                data=data,
+                x=x,
+                y='value',
+                hue=hue_col,
+                ax=ax,
+                dodge=dodge_point
+            )
+
+        ax.set_xlabel(x.capitalize())
+        ax.set_ylabel(metric.capitalize())
+
+        if not sig:
+            fig.tight_layout()
+            return fig, ax
+
+        if hue_col is None:
+            levels = sorted(data[x].dropna().unique())
+            pairs = list(itertools.combinations(levels, 2))
+
+            if not pairs:
+                fig.tight_layout()
+                return fig, ax
+
+            annot = Annotator(
+                ax,
+                pairs,
+                data=data,
+                x=x,
+                y='value'
+            )
+
+        else:
+            x_levels = sorted(data[x].dropna().unique())
+            h_levels = sorted(data[hue_col].dropna().unique())
+
+            if sig in [True, 'within']:
+                pairs = [
+                    ((xv, h1), (xv, h2))
+                    for xv in x_levels
+                    for h1, h2 in itertools.combinations(h_levels, 2)
+                ]
+
+            elif sig == 'between':
+                pairs = [
+                    ((x1, hv), (x2, hv))
+                    for hv in h_levels
+                    for x1, x2 in itertools.combinations(x_levels, 2)
+                ]
+
+            else:
+                raise ValueError("sig must be 'within', 'between', or bool")
+
+            if not pairs:
+                fig.tight_layout()
+                return fig, ax
+
+            annot = Annotator(
+                ax,
+                pairs,
+                data=data,
+                x=x,
+                y='value',
+                hue=hue_col
+            )
+
+        annot.configure(
+            test=test,
+            text_format='star',
+            loc='inside',
+            verbose=False,
+            hide_non_significant=True
+        )
+        annot.apply_and_annotate()
+
+        fig.tight_layout()
+        return fig, ax
+
+    fig_axs = []
+
+    for metric in metrics:
+        metric_filters = filters.copy()
+        metric_filters['metric'] = metric
+
+        filt = filter_df(df, metric_filters)
+
+        if hue:
+            for x_col, hue_col in itertools.permutations(cols, 2):
+                fig_axs.append(
+                    mxpointplot(
+                        data=filt,
+                        x=x_col,
+                        metric=metric,
+                        hue_col=hue_col
+                    )
+                )
+        else:
+            for col in cols:
+                fig_axs.append(
+                    mxpointplot(
+                        data=filt,
+                        x=col,
+                        metric=metric,
+                        hue_col=None
+                    )
+                )
+
+    return fig_axs
 
 # Expt
 def devplot(

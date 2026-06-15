@@ -3,16 +3,83 @@ from .layers import Dims, SetPooling, Sequential
 from .utils import build_hidden_dims, cloneable, clone_or_init, input_to_dict
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 
 # typing
 from .data import GraphDataset
 from .norm import Normalizer
+from .train import Loader, LoaderStats
 from torch import Tensor
 from torch_geometric.data import Data
-from typing import Literal, Union, overload
+from typing import Literal, Union
 
 ## General
-    
+
+@cloneable
+class NBGLM(nn.Module):
+    def __init__(self, dataset:GraphDataset, target_class:int|list[int]|None=None, eps:float=1e-8, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.target_class = target_class
+        self.eps = eps
+
+        self.mu = None
+        self.theta = None
+
+        # placeholder dims
+        self.dims = Dims(dataset=dataset, embed_dim=1, head_dim=None, num_heads=1, method='node')
+
+    def init_with_loader(self, loader:Loader):
+        self.num_nodes = loader.num_nodes
+        self.num_features = loader.num_features
+        self.num_classes = loader.num_classes
+        dataloader = loader.train_loader
+
+        _stats = LoaderStats(self.num_nodes, self.num_features, eps=self.eps)
+
+        for batch in dataloader:
+            x = _stats.filter_batch(batch, target_class=self.target_class)
+
+            # skip if no samples (after filtering)
+            if x is None:
+                continue
+
+            # update trackers
+            _stats.update(x)
+
+        if _stats.count == 0:
+            raise ValueError("No samples found for the specified class(es).")
+        
+        # compute stats
+        mean, _, _ = _stats.compute()
+
+        # global parameters (GLM)
+        self.mu = nn.Parameter(mean)
+        self.theta = nn.Parameter(loader.stats['theta'])
+
+    def forward(self, input:Union[Data, Tensor, dict], need_weights:bool=False):
+        # ensure initialized
+        if self.num_nodes is None or self.num_features is None:
+            raise ValueError("Normalizer not initialized. Call 'init_with_loader' with a Loader to initialize.")
+        
+        data = input_to_dict(input)
+        x = data['x'].view(-1, self.num_nodes)
+        batch_size = x.size(0)
+        mu = self.mu.view(1, self.num_nodes).expand(batch_size, -1)
+
+        out = {}
+        out['x'] = x
+        out['theta'] = self.theta.view(1, self.num_nodes)
+        out['batch_size'] = batch_size
+        out['num_nodes'] = self.num_nodes
+        
+        # GLM predictions
+        out['x_pred'] = mu.detach()
+        out['x_t'] = out['x']
+        out['x_t_pred'] = out['x_pred']
+
+        return out
+
+
 @cloneable
 class Encoder(nn.Module):
     def __init__(
@@ -28,7 +95,8 @@ class Encoder(nn.Module):
         # new layer params
         hidden_dims: int | list[int] | None = None, 
         act_fn: nn.Module | None = None, 
-        norm_fn: Literal['batch','layer'] | None = None, 
+        norm_fn: Literal['batch','layer'] | None = None,
+        dropout: float | None = None,
         end_fn: bool | nn.Module = False,
 
         # kwargs
@@ -50,7 +118,7 @@ class Encoder(nn.Module):
         hidden_dims = build_hidden_dims(self.embed_dim, hidden_dims)
 
         # init norm
-        self.norm = clone_or_init(
+        self.norm: Normalizer = clone_or_init(
             name='norm_class',
             obj=norm_class,
             base_class=nn.Module,
@@ -69,6 +137,7 @@ class Encoder(nn.Module):
                 hidden_dims=hidden_dims,
                 act_fn=act_fn,
                 norm_fn=norm_fn,
+                dropout=dropout,
                 end_fn=end_fn,
             )
         )
@@ -88,6 +157,7 @@ class Encoder(nn.Module):
                     hidden_dims=hidden_dims,
                     act_fn=act_fn,
                     norm_fn=norm_fn,
+                    dropout=dropout,
                     end_fn=end_fn,
                     **pooling_kwargs
                 )
@@ -169,11 +239,18 @@ class Encoder(nn.Module):
         out = {}
         out['x'] = x
         out['x_t'] = x_t
+
+        # for libnorm
         out['libsize'] = data.get('libsize', None)
+        out['libscale'] = self.norm.libscale.detach() if hasattr(self.norm, 'libscale') else None
+
+        # for multiloss
         out['batch_size'] = h_node.shape[0]
         out['num_nodes'] = h_node.shape[1]
-        # out['mu'] = data.get('mu') # nbloss
-        # out['theta'] = data.get('theta') # nbloss
+
+        # for NB loss
+        # out['mu'] = data.get('mu')
+        # out['theta'] = self.norm.theta if hasattr(self.norm, 'theta') else None
 
         if need_weights:
             out['layer_outs'] = {}
@@ -198,7 +275,8 @@ class Latent(nn.Module):
         # new layer params
         hidden_dims: int | list[int] | None = None, 
         act_fn: nn.Module | None = None, 
-        norm_fn: Literal['batch','layer'] | None = None, 
+        norm_fn: Literal['batch','layer'] | None = None,
+        dropout: float | None = None,
         end_fn: bool | nn.Module = False,
 
         # kwargs
@@ -230,6 +308,7 @@ class Latent(nn.Module):
                     hidden_dims=hidden_dims,
                     act_fn=act_fn,
                     norm_fn=norm_fn,
+                    dropout=dropout,
                     end_fn=end_fn,
                 )
             )
@@ -246,6 +325,7 @@ class Latent(nn.Module):
                 hidden_dims=hidden_dims,
                 act_fn=act_fn,
                 norm_fn=norm_fn,
+                dropout=dropout,
                 end_fn=end_fn,
                 **pooling_kwargs
             )
@@ -268,6 +348,7 @@ class Latent(nn.Module):
                     hidden_dims=hidden_dims,
                     act_fn=act_fn,
                     norm_fn=norm_fn,
+                    dropout=dropout,
                     end_fn=end_fn,
                 )
             )
@@ -348,7 +429,8 @@ class BaseModel(nn.Module):
         # new layer params
         hidden_dims: int | list[int] | None = None, 
         act_fn: nn.Module | None = None, 
-        norm_fn: Literal['batch','layer'] | None = None, 
+        norm_fn: Literal['batch','layer'] | None = None,
+        dropout: float | None = None,
         end_fn: bool | nn.Module = False,
 
         # kwargs
@@ -358,6 +440,7 @@ class BaseModel(nn.Module):
         super().__init__()
         norm_kwargs = {} if norm_kwargs is None else norm_kwargs
         pooling_kwargs = {} if pooling_kwargs is None else pooling_kwargs
+        self.theta = None
 
         # get dims
         self.dims = Dims(
@@ -373,14 +456,14 @@ class BaseModel(nn.Module):
         self.encoder = Encoder(
             dims=self.dims, method=method,
             norm_class=norm_class, encoder_class=encoder_class, pooling_class=pooling_class,
-            hidden_dims=self.hidden_dims, act_fn=act_fn, norm_fn=norm_fn, end_fn=end_fn,
+            hidden_dims=self.hidden_dims, act_fn=act_fn, norm_fn=norm_fn, dropout=dropout, end_fn=end_fn,
             norm_kwargs=norm_kwargs, pooling_kwargs=pooling_kwargs
         )
 
         self.latent = Latent(
             dims=self.dims,
             mlp=mlp, pooling_class=pooling_class, variational=variational,
-            hidden_dims=self.hidden_dims, act_fn=act_fn, norm_fn=norm_fn, end_fn=end_fn,
+            hidden_dims=self.hidden_dims, act_fn=act_fn, norm_fn=norm_fn, dropout=dropout, end_fn=end_fn,
             pooling_kwargs=pooling_kwargs
         )
 
@@ -395,6 +478,7 @@ class BaseModel(nn.Module):
                 hidden_dims=self.hidden_dims,
                 act_fn=act_fn,
                 norm_fn=norm_fn,
+                dropout=dropout,
                 end_fn=False, # no final layer, output raw logits
             )
         )
@@ -402,6 +486,9 @@ class BaseModel(nn.Module):
     def init_with_loader(self, loader): # pass loader to Encoder -> Norm
         if callable(getattr(self.encoder.norm, 'init_with_loader', None)):
             self.encoder.norm.init_with_loader(loader)
+
+        # theta
+        self.theta = self.encoder.norm.theta if hasattr(self.encoder.norm, 'theta') else None
 
     def forward(self, input:Union[Data, Tensor, dict], need_weights:bool=False):
         # get latent embedding
@@ -447,6 +534,7 @@ class BaseClassifier(BaseModel):
         hidden_dims: int | list[int] | None = None, 
         act_fn: nn.Module | None = None, 
         norm_fn: Literal['batch','layer'] | None = None, 
+        dropout: float | None = None,
         end_fn: bool | nn.Module = False,
 
         # kwargs
@@ -460,7 +548,7 @@ class BaseClassifier(BaseModel):
         super().__init__(
             dataset, out_dim, embed_dim, head_dim, num_heads, method,
             norm_class, encoder_class, pooling_class, mlp, variational, out_module,
-            hidden_dims, act_fn, norm_fn, end_fn,
+            hidden_dims, act_fn, norm_fn, dropout, end_fn,
             norm_kwargs, pooling_kwargs,
         )
 
@@ -499,6 +587,7 @@ class BaseAutoencoder(BaseModel):
         hidden_dims: int | list[int] | None = None, 
         act_fn: nn.Module | None = None, 
         norm_fn: Literal['batch','layer'] | None = None, 
+        dropout: float | None = None,
         end_fn: bool | nn.Module = False,
 
         # kwargs
@@ -512,7 +601,7 @@ class BaseAutoencoder(BaseModel):
         super().__init__(
             dataset, out_dim, embed_dim, head_dim, num_heads, method,
             norm_class, encoder_class, pooling_class, mlp, variational, out_module,
-            hidden_dims, act_fn, norm_fn, end_fn,
+            hidden_dims, act_fn, norm_fn, dropout, end_fn,
             norm_kwargs, pooling_kwargs
         )
 
@@ -526,10 +615,232 @@ class BaseAutoencoder(BaseModel):
         # # convert to model space (for loss computation)
         # libsize = data.get('libsize', None)
         # x = self.encoder.norm.transform(x, libsize=libsize)
+
         data['x_t_pred'] = x.view(self.encoder.orig_shape)
 
         # format output
         del data['x'] # avoid overlap with batch dict
         if need_weights:
             data['layer_outs']['dec'] = out
+        return data
+
+@cloneable
+class CountsAutoencoder(BaseModel):
+    def __init__(
+        self,
+        dataset: GraphDataset, # dims
+        out_dim: int | None = None, # output
+        embed_dim: int | None = None, # dims
+        head_dim: int | None = None,  # dims
+        num_heads: int = 1,  # dims
+        method: Literal['node','set'] = 'node', # dims, encoder; twin removed for now
+
+        # layers
+        norm_class: Normalizer | None = None, # encoder
+        encoder_class: nn.Module | type[nn.Module] | None = None, # encoder
+        pooling_class: SetPooling | type[SetPooling] = SetPooling, # encoder, latent
+        mlp: bool | nn.Module = False, # latent
+        variational: bool | nn.Module = False, # latent
+        out_module: nn.Module | type[nn.Module] = nn.Linear, # output
+
+        # new layer params
+        hidden_dims: int | list[int] | None = None, 
+        act_fn: nn.Module | None = None, 
+        norm_fn: Literal['batch','layer'] | None = None, 
+        dropout: float | None = None,
+        end_fn: bool | nn.Module = False,
+
+        # kwargs
+        norm_kwargs: dict | None = None, # encoder
+        pooling_kwargs: dict | None = None, # encoder, latent
+    ):
+        # default: out_dim = num_nodes (for reconstruction)
+        out_dim = dataset[0].num_nodes if out_dim is None else out_dim
+
+        # call init
+        super().__init__(
+            dataset, out_dim, embed_dim, head_dim, num_heads, method,
+            norm_class, encoder_class, pooling_class, mlp, variational, out_module,
+            hidden_dims, act_fn, norm_fn, dropout, end_fn,
+            norm_kwargs, pooling_kwargs
+        )
+
+    def forward(self, input:Union[Data, Tensor, dict], need_weights:bool=False):
+        x, out, data = super().forward(input, need_weights)
+        data['x_t_pred'] = x
+
+        # model space -> raw space
+        libsize = data.get('libsize', None)
+        x = self.encoder.norm.inverse_transform(x, libsize=libsize)
+        data['x_pred'] = x
+
+        # for loss computation
+        out_shape = data['x_pred'].shape
+
+        data['x'] = input_to_dict(input)['x'].float().view(out_shape)
+        data['x_t'] = data['x_t'].view(out_shape)
+        data['theta'] = self.encoder.norm.theta.view(1, -1) if hasattr(self.encoder.norm, 'theta') else None
+
+        if need_weights:
+            data['layer_outs']['dec'] = out
+
+        return data
+
+@cloneable
+class MultiLatentModel(nn.Module):
+    def __init__(
+        self,
+        dataset: GraphDataset, # dims
+        embed_dim: int | None = None, # dims
+        head_dim: int | None = None,  # dims
+        num_heads: int = 1,  # dims
+        method: Literal['node','set'] = 'node', # dims, encoder; twin removed for now
+
+        # layers
+        norm_class: Normalizer | None = None, # encoder
+        encoder_class: nn.Module | type[nn.Module] | None = None, # encoder
+        pooling_class: SetPooling | type[SetPooling] = SetPooling, # encoder, latent
+        mlp: bool | nn.Module = False, # latent
+        variational: bool | nn.Module = False,  # latent
+
+        # new layer params
+        hidden_dims: int | list[int] | None = None, 
+        act_fn: nn.Module | None = None, 
+        norm_fn: Literal['batch','layer'] | None = None, 
+        dropout: float | None = None,
+        end_fn: bool | nn.Module = False,
+
+        # kwargs
+        norm_kwargs: dict | None = None, # encoder
+        pooling_kwargs: dict | None = None, # encoder, latent
+    ):
+        super().__init__()
+        norm_kwargs = {} if norm_kwargs is None else norm_kwargs
+        pooling_kwargs = {} if pooling_kwargs is None else pooling_kwargs
+        self.theta = None
+
+        # get dims
+        self.dims = Dims(
+            dataset=dataset,
+            embed_dim=embed_dim, head_dim=head_dim, num_heads=num_heads,
+            method=method
+        )
+
+        # build hidden_dims from Dims
+        self.hidden_dims = build_hidden_dims(self.dims.embed_dim, hidden_dims)
+
+        # common encoder, theta
+        self.encoder = Encoder(
+            dims=self.dims, method=method,
+            norm_class=norm_class, encoder_class=encoder_class, pooling_class=pooling_class,
+            hidden_dims=self.hidden_dims, act_fn=act_fn, norm_fn=norm_fn, dropout=dropout, end_fn=end_fn,
+            norm_kwargs=norm_kwargs, pooling_kwargs=pooling_kwargs
+        )
+
+        
+        
+        # ae layers
+        self.latent_ae = Latent(
+            dims=self.dims,
+            mlp=mlp, pooling_class=pooling_class, variational=variational,
+            hidden_dims=self.hidden_dims, act_fn=act_fn, norm_fn=norm_fn, dropout=dropout, end_fn=end_fn,
+            pooling_kwargs=pooling_kwargs
+        )
+
+        self.decoder = Sequential(
+                in_channels=self.dims.embed_dim,
+                out_channels=self.dims.num_nodes,
+                layer_class=nn.Linear,
+                hidden_dims=self.hidden_dims,
+                act_fn=act_fn,
+                norm_fn=norm_fn,
+                dropout=dropout,
+                end_fn=False, # no final layer, output raw logits
+        )
+
+        # cl layers
+        self.latent_cl = Latent(
+            dims=self.dims,
+            mlp=mlp, pooling_class=pooling_class, variational=variational,
+            hidden_dims=self.hidden_dims, act_fn=act_fn, norm_fn=norm_fn, dropout=dropout, end_fn=end_fn,
+            pooling_kwargs=pooling_kwargs
+        )
+
+        self.classifier = Sequential(
+                in_channels=self.dims.embed_dim,
+                out_channels=self.dims.num_classes,
+                layer_class=nn.Linear,
+                hidden_dims=self.hidden_dims,
+                act_fn=act_fn,
+                norm_fn=norm_fn,
+                dropout=dropout,
+                end_fn=False, # no final layer, output raw logits
+        )
+
+    def _forward_head(self, data:dict, latent:nn.Module, out_layer:nn.Module, need_weights:bool):
+        d = data.copy()
+
+        # reset layer_outs
+        if need_weights: 
+            d['layer_outs'] = {} 
+
+        # forward pass
+        out = latent(d, need_weights)
+        out = out_layer(out, return_dict=need_weights, return_attention_weights=need_weights)
+
+        # extract x
+        if isinstance(out, Tensor):
+            x = out
+            out = None
+        else:
+            out = input_to_dict(out)
+            x = out.pop('x')
+
+        return x, out, d
+
+    def _merge_data(self, data1:dict, data2:dict, suffix:str=''):
+        for key2, val2 in list(data2.items()):
+            if key2 not in data1:
+                data1[f'{key2}{suffix}'] = val2
+        return data1
+    
+    def init_with_loader(self, loader): # pass loader to Encoder -> Norm
+        if callable(getattr(self.encoder.norm, 'init_with_loader', None)):
+            self.encoder.norm.init_with_loader(loader)
+
+        self.theta = self.encoder.norm.theta if hasattr(self.encoder.norm, 'theta') else None
+
+    def forward(self, input:Union[Data, Tensor, dict], need_weights:bool=False):
+        # get common encoding
+        data:dict = self.encoder(input, need_weights)
+        data['theta'] = self.encoder.norm.theta.view(1, -1) if hasattr(self.encoder.norm, 'theta') else None
+
+        # autoencoder
+        x_t_pred, ae_out, data_ae = self._forward_head(data, self.latent_ae, self.decoder, need_weights)
+        x_pred = self.encoder.norm.inverse_transform(x_t_pred, data.get('libsize', None))
+            
+        # classifier
+        y_logits, cl_out, data_cl = self._forward_head(data, self.latent_cl, self.classifier, need_weights)
+
+        # format output
+        data = self._merge_data(data, data_ae, suffix='_ae')
+        data = self._merge_data(data, data_cl, suffix='_cl')
+
+        x_out_shape = x_pred.shape
+        data['x'] = input_to_dict(input)['x'].float().view(x_out_shape)
+        data['x_t'] = data['x_t'].view(x_out_shape)
+
+        data['x_t_pred'] = x_t_pred
+        data['x_pred'] = x_pred
+
+        data['y_logits'] = y_logits
+        data['y_prob'] = y_logits.softmax(dim=-1)
+        data['y_pred'] = y_logits.argmax(dim=-1)
+
+        if need_weights:
+            data['layer_outs']['lp_ae'] = data_ae['layer_outs'].get('lp', None)
+            data['layer_outs']['lp_cl'] = data_cl['layer_outs'].get('lp', None)
+            data['layer_outs']['out_ae'] = ae_out
+            data['layer_outs']['out_cl'] = cl_out
+
         return data

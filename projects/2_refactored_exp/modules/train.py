@@ -152,6 +152,7 @@ class Loader():
             'lib_median': lib_median
         }
 
+# Trainer
 class EarlyStopping():
     def __init__(
         self,
@@ -248,9 +249,8 @@ class Trainer():
     def __init__(
         self, 
         lr: float,
-        pos_keys: str | list[str],
-        out_keys: str | list[str] | dict[str,str] | None = None,
-        batch_keys: str | list[str] | dict[str,str] | None = None,
+        pos_keys: str | list[str] | None = None,
+        kw_keys: str | list[str] | dict[str,str] | None = None,
         loss_class: type[nn.Module] | None = None,
         loss_kwargs: dict | None = None,
         optim_class: type[optim.Optimizer] = optim.Adam, 
@@ -264,9 +264,9 @@ class Trainer():
         if loss_class is None:
             raise ValueError("'loss_class' must be provided.")
         
-        # ensure one of (batch_keys, out_keys) is provided
-        if batch_keys is None and out_keys is None:
-            raise ValueError("One of 'batch_keys' or 'out_keys' must be provided.")
+        # ensure kw_keys is provided !!!
+        if kw_keys is None:
+            raise ValueError("'kw_keys' must be provided.")
         
         # get kwargs
         sig = inspect.signature(type(self).__init__)
@@ -274,20 +274,21 @@ class Trainer():
             sig, self, 
             lr=lr, 
             pos_keys=pos_keys, 
-            out_keys=out_keys, 
-            batch_keys=batch_keys, 
+            kw_keys=kw_keys,
             loss_class=loss_class, 
             loss_kwargs=loss_kwargs, 
             optim_class=optim_class, 
-            optim_kwargs=optim_kwargs, 
+            optim_kwargs=optim_kwargs,
+            early_stop=early_stop,
+            stop_metric=stop_metric,
+            stop_kwargs=stop_kwargs, 
             **kwargs
         )
 
         # defaults
         self.lr = lr
         self.pos_keys = pos_keys
-        self.out_keys = out_keys
-        self.batch_keys = batch_keys
+        self.kw_keys = kw_keys
         self.loss_class = loss_class
         self.loss_kwargs = {} if loss_kwargs is None else dict(loss_kwargs)
         self.optim_class = optim_class
@@ -318,7 +319,7 @@ class Trainer():
         self.dev_metrics = {}
 
         # early stopping
-        stopper = EarlyStopping(**self.stop_kwargs) if self.early_stop else None
+        stopper = EarlyStopping(**self.stop_kwargs)
 
         # start timer
         if torch.cuda.is_available(): torch.cuda.synchronize()
@@ -344,12 +345,13 @@ class Trainer():
             pbar.set_postfix_str(epoch_report)
 
             # early stopping
-            if stopper is not None:
-                stopper.update_and_save(val_metrics, epoch, self.model, metric=self.stop_metric)
-                if stopper.should_stop:
-                    if stopper.best_state is not None:
-                        self.model.load_state_dict(stopper.best_state) 
-                    break
+            stopper.update_and_save(val_metrics, epoch, self.model, metric=self.stop_metric)
+            if stopper.should_stop and self.early_stop:
+                break
+        
+        # load best model state
+        if stopper.best_state is not None:
+            self.model.load_state_dict(stopper.best_state)
 
         # test
         self.test_metrics, self.test_values = self._run_phase('eval', loader.test_loader)
@@ -431,9 +433,8 @@ class Trainer():
         batch = input_to_dict(batch, 'batch')
 
         # merge and append
-        data = {**out, **batch}
+        data = {**batch, **out}
         batch_log['data'].append(data)
-
         return batch_log
     
     def _detach_items(self, item):
@@ -467,8 +468,7 @@ class Trainer():
         self.loss_fn = LossWrapper(
             loss_fn = self.loss_class(**self.loss_kwargs),
             pos_keys = self.pos_keys,
-            out_keys = self.out_keys,
-            batch_keys = self.batch_keys
+            kw_keys = self.kw_keys,
         )
     
     def _compute_metrics(self, batch_log:dict): # change in child
@@ -485,6 +485,98 @@ class Trainer():
 
         return metrics, values
 
+class MultiTrainerStage():
+    def __init__(self, name:str, trainer:Trainer, num_epochs:int|None=None, train:str|list[str]|None=None):
+        self.name = name
+        self.trainer = trainer
+        self.num_epochs = num_epochs
+
+        # ensure list
+        if isinstance(train, str) or train is None:
+            self.train = [train] if train is not None else []
+        else: 
+            self.train = list(train)
+
+    def apply(self, model:nn.Module):
+        # freeze all params
+        for param in model.parameters():
+            param.requires_grad = False
+
+        # unfreeze specified modules
+        for module_name in self.train:
+            if not hasattr(model, module_name):
+                raise AttributeError(f"[Stage {self.name}] model has no submodule '{module_name}'")
+            
+            module: nn.Module = getattr(model, module_name)
+            for param in module.parameters():
+                param.requires_grad = True
+
+class MultiTrainer(Trainer):
+    def __init__(self, stages: list[MultiTrainerStage]):
+        self.stages = stages
+        self._orig_kwargs = {s.name: getattr(s.trainer, "_orig_kwargs", type(s.trainer).__name__) for s in stages}
+
+    def run(
+        self,
+        model: nn.Module,
+        loader: Loader,
+        num_epochs: int,
+        report_metrics: str | list[str] | None = None,
+        verbose: bool = False,
+    ):
+        # init outputs to match Trainer behavior
+        self.dev_metrics = {}
+        self.test_metrics = {}
+        self.test_values = {}
+        self.test_report = ''
+
+        # carry-forward model across stages
+        cur_model = model
+
+        for stage in self.stages:
+            # freeze/train modules as specified    
+            stage.apply(cur_model)
+
+            # run stage
+            stage.trainer.run(
+                model = cur_model,
+                loader = loader,
+                num_epochs = stage.num_epochs if stage.num_epochs is not None else num_epochs,
+                report_metrics = report_metrics,
+                verbose = verbose,
+            )
+
+            # aggregate dev_metrics
+            for epoch, phases in stage.trainer.dev_metrics.items():
+                self.dev_metrics.setdefault(epoch, {})
+                for phase, metrics in phases.items(): # phase: 'train' or 'val'
+                    self.dev_metrics[epoch].setdefault(phase, {})                    
+                    self.dev_metrics[epoch][phase].update({f"{k}_{stage.name}": v for k,v in metrics.items()})
+
+            # aggregate test_metrics, test_values, test_report
+            tm = getattr(stage.trainer, "test_metrics", {}) or {}
+            tv = getattr(stage.trainer, "test_values", {}) or {}
+
+            for k,v in tm.items():
+                self.test_metrics[f"{k}_{stage.name}"] = v
+
+            for k,v in tv.items():
+                self.test_values[f"{k}_{stage.name}"] = v
+
+            # carry forward trained model
+            cur_model = stage.trainer.model
+
+        # final outputs
+        self.model = cur_model
+
+        self.test_report = ' | '.join(
+            f'{stage.name}: {stage.trainer.test_report}'
+            for stage in self.stages
+            if getattr(stage.trainer, 'test_report', None)
+        )
+
+
+# Experiment
 class Experiment():
     def __init__(
         self,

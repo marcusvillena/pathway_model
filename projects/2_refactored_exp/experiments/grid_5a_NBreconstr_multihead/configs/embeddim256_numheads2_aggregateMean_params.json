@@ -1,0 +1,74 @@
+{
+    "model": {
+        "dataset": "GraphDataset",
+        "out_dim": 4373,
+        "embed_dim": 256,
+        "head_dim": null,
+        "num_heads": 2,
+        "method": "node",
+        "norm_class": "LogCounts",
+        "encoder_class": "Linear",
+        "pooling_class": "MultiheadSetPooling",
+        "mlp": false,
+        "variational": true,
+        "out_module": "Linear",
+        "hidden_dims": 1,
+        "act_fn": "ReLU",
+        "norm_fn": "layer",
+        "end_fn": false,
+        "norm_kwargs": {
+            "libnorm": true,
+            "znorm": true,
+            "learnable": true
+        },
+        "pooling_kwargs": {
+            "aggregate": "mean"
+        }
+    },
+    "trainer": {
+        "lr": 0.001,
+        "pos_keys": null,
+        "kw_keys": {
+            "x": "x",
+            "x_pred": "x_pred",
+            "theta": "theta",
+            "z_mu": "z_mu",
+            "z_logvar": "z_logvar",
+            "batch_size": "batch_size",
+            "num_nodes": "num_nodes"
+        },
+        "loss_class": "MultiLoss",
+        "loss_kwargs": {
+            "loss_classes": [
+                "NBLoss",
+                "KLDLoss"
+            ],
+            "loss_weights": [
+                1.0,
+                0.0001
+            ],
+            "loss_inputs": [
+                {
+                    "x": "x",
+                    "mu": "x_pred",
+                    "theta": "theta"
+                },
+                {
+                    "mu": "z_mu",
+                    "logvar": "z_logvar"
+                }
+            ]
+        },
+        "optim_class": "Adam",
+        "optim_kwargs": null,
+        "early_stop": true,
+        "stop_metric": "loss",
+        "stop_kwargs": null,
+        "metric_keys": {
+            "pred": "x_pred",
+            "target": "x"
+        },
+        "trainer_norm_class": "LogCounts",
+        "trainer_norm_kwargs": {}
+    }
+}

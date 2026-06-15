@@ -1,0 +1,10 @@
+pooling_class,num_heads,aggregate,config
+MultiheadSetPooling,1,concat,mh_numheads1_aggregateConcat
+MultiheadSetPooling,1,mean,mh_numheads1_aggregateMean
+MultiheadSetPooling,2,concat,mh_numheads2_aggregateConcat
+MultiheadSetPooling,2,mean,mh_numheads2_aggregateMean
+MultiheadSetPooling,4,concat,mh_numheads4_aggregateConcat
+MultiheadSetPooling,4,mean,mh_numheads4_aggregateMean
+MultiheadSetPooling,8,concat,mh_numheads8_aggregateConcat
+MultiheadSetPooling,8,mean,mh_numheads8_aggregateMean
+AttentionSetPooling,0,none,as_config

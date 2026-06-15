@@ -1,0 +1,49 @@
+{
+    "model": {
+        "dataset": "GraphDataset",
+        "embed_dim": 128,
+        "head_dim": null,
+        "num_heads": 1,
+        "method": "set",
+        "norm_class": "LogCounts",
+        "encoder_class": "Linear",
+        "pooling_class": "AttentionSetPooling",
+        "mlp": false,
+        "variational": false,
+        "hidden_dims": 1,
+        "act_fn": "ReLU",
+        "norm_fn": "layer",
+        "dropout": null,
+        "end_fn": false,
+        "norm_kwargs": {
+            "libnorm": true,
+            "znorm": true,
+            "learnable": true
+        },
+        "pooling_kwargs": null
+    },
+    "trainer": {
+        "lr": 0.001,
+        "pos_keys": null,
+        "kw_keys": {
+            "input": "y_logits",
+            "target": "y",
+            "batch_size": "batch_size",
+            "num_nodes": "num_nodes"
+        },
+        "loss_class": "CrossEntropyLoss",
+        "loss_kwargs": null,
+        "optim_class": "Adam",
+        "optim_kwargs": null,
+        "early_stop": true,
+        "stop_metric": "accuracy",
+        "stop_kwargs": {
+            "mode": "max"
+        },
+        "metric_keys": {
+            "pred": "input",
+            "target": "target"
+        },
+        "weight_method": "balanced"
+    }
+}

@@ -1,0 +1,7 @@
+method,encoder_class,config
+node,Linear,methodNode_encoderclassLinear
+node,GCNConv,methodNode_encoderclassGCNConv
+node,GATConv,methodNode_encoderclassGATConv
+set,Linear,methodSet_encoderclassLinear
+set,GCNConv,methodSet_encoderclassGCNConv
+set,GATConv,methodSet_encoderclassGATConv

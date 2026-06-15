@@ -10,8 +10,7 @@ class LossWrapper(nn.Module):
         self, 
         loss_fn:nn.Module, 
         pos_keys:str|list[str]|None = None,
-        out_keys:str|list[str]|dict[str,str]|None = None,
-        batch_keys:str|list[str]|dict[str,str]|None = None
+        kw_keys:str|list[str]|dict[str,str]|None = None,
     ):
         '''
         pos_keys: str or list[str] of x_key names passed to loss_fn
@@ -21,33 +20,25 @@ class LossWrapper(nn.Module):
         super().__init__()
         self.loss_fn = loss_fn
         pos_keys = [] if pos_keys is None else pos_keys
-        out_keys = {} if out_keys is None else out_keys
-        batch_keys = {} if batch_keys is None else batch_keys
+        kw_keys = {} if kw_keys is None else kw_keys
 
         # format pos_keys
         self.pos_keys: list[str] = [pos_keys] if isinstance(pos_keys,str) else pos_keys
 
-        # format out_keys
-        if isinstance(out_keys, str):
-            out_keys = {out_keys:out_keys}
-        elif isinstance(out_keys, (list,tuple,set)):
-            out_keys = {i:i for i in out_keys}
-    
-        # format batch_keys
-        if isinstance(batch_keys, str):
-            batch_keys = {batch_keys:batch_keys}
-        elif isinstance(batch_keys, (list,tuple,set)):
-            batch_keys = {i:i for i in batch_keys}
-
-        # merge batch_keys, out_keys into extra_keys
-        self.extra_keys: dict[str,str] = {**out_keys, **batch_keys}
+        # format kw_keys
+        if isinstance(kw_keys, str):
+            kw_keys = {kw_keys:kw_keys}
+        if isinstance(kw_keys, (list,tuple,set)):
+            kw_keys = {i:i for i in kw_keys}
+        self.kw_keys: dict[str,str] = kw_keys
 
         # safety checks
-        if not self.extra_keys:
-            raise ValueError("One of 'batch_keys' or 'out_keys' must be provided.")
-        missing_keys = [key for key in self.pos_keys if key not in self.extra_keys]
+        if not self.kw_keys:
+            raise ValueError("'kw_keys' must be provided.")
+        missing_keys = [key for key in self.pos_keys if key not in self.kw_keys]
         if missing_keys:
-            raise ValueError(f"All 'pos_keys' must be in one of 'batch_keys' or 'out_keys'. Missing {missing_keys}")
+            raise ValueError(f"All 'pos_keys' must be in 'kw_keys'. Missing {missing_keys}")
+
 
     def forward(self, out:dict[str,Any], batch:dict[str,Any]):
         # input to dict
@@ -55,18 +46,18 @@ class LossWrapper(nn.Module):
         batch = input_to_dict(batch)
 
         # extract kwargs, return
-        values = {**out, **batch}
-        extra_kwargs = {key:values[value_key] for key,value_key in self.extra_keys.items()}
+        values = {**batch, **out}
+        kw_kwargs = {key:values[value_key] for key,value_key in self.kw_keys.items()}
 
         # get pos args
         pos_args = []
         for key in self.pos_keys:
             try:
-                pos_args.append(extra_kwargs.pop(key))
+                pos_args.append(kw_kwargs.pop(key))
             except KeyError:
-                raise KeyError(f"pos_arg {key} not in extra_kwargs. Check pos_keys/batch_keys/out_keys.")
+                raise KeyError(f"pos_arg {key} not in kw_kwargs. Check pos_keys/kw_keys.")
 
-        return filter_kwargs(self.loss_fn.forward)(*pos_args, **extra_kwargs)
+        return filter_kwargs(self.loss_fn.forward)(*pos_args, **kw_kwargs)
 
 def reduce_loss(x:Tensor, reduction:Literal['none','sum','mean']='mean', dim:int|list[int]|None=None):
     # reduces/aggregates loss output
@@ -118,9 +109,6 @@ class MultiLoss(nn.Module):
             if w.numel() != self.num_losses: # ensure dims match
                 raise RuntimeError(f'Number of loss_weights ({w.numel()}) must match number of losses ({self.num_losses})')
 
-        # normalize to mean = 1
-        w = w / w.mean()
-
         # save to self (buffer)
         return w
 
@@ -130,8 +118,10 @@ class MultiLoss(nn.Module):
             return [None] * self.num_losses
         
         # ensure list
-        if not isinstance(loss_inputs, list):
+        if not isinstance(loss_inputs, (list,tuple,set)):
             loss_inputs = [loss_inputs]
+        else:
+            loss_inputs = list(loss_inputs)
 
         # normalize to mapping (dict)
         for idx, item in enumerate(loss_inputs):
@@ -208,61 +198,6 @@ class MultiLoss(nn.Module):
 
         return loss
 
-# experimental, not sure if did anything
-class EMAMultiLoss(MultiLoss):
-    def __init__(
-        self, 
-        loss_classes: type[nn.Module] | list[type[nn.Module]],
-        loss_weights: list[float] | None = None,
-        reduction: Literal['none','sum','mean'] = 'mean',
-        ema_norm: bool = False,
-        alpha: float = 0.01,
-        eps: float = 1e-8,
-        **kwargs
-    ):
-        super().__init__(
-            loss_classes=loss_classes, 
-            loss_weights=loss_weights, 
-            reduction=reduction,
-            eps=eps, 
-            **kwargs
-        )
-
-        self.ema_norm = ema_norm
-        self.alpha = alpha
-        self.register_buffer('ema', None)
-
-    def ema_norm_transform(self, loss:Tensor):
-        with torch.no_grad():
-            # make into broadcastable shape, (num_losses, 1)
-            stat = loss.detach().view(loss.size(0), -1).mean(dim=1, keepdim=True)
-
-            # calculate, update ema
-            if self.ema is None:
-                self.ema = stat
-            else:
-                self.ema = (1 - self.alpha) * self.ema + self.alpha * stat
-
-        # normalize, broadcasts self.ema to loss shape (num_losses, ...)
-        return loss / torch.clamp(self.ema, min=self.eps)
-
-    def forward(self, **kwargs):
-        # compute losses
-        losses = [filter_kwargs(loss_fn.forward)(**kwargs) for loss_fn in self.loss_fns]
-        losses = torch.stack(losses, dim=0)
-        
-        # normalize losses via 1/ema
-        if self.ema_norm:
-            losses = self.ema_norm_transform(losses)
-
-        # apply weights
-        losses = losses * self.loss_weights
-
-        # reduce/aggregate loss
-        loss = reduce_loss(losses, reduction=self.reduction)
-
-        return loss
-
 class KLDLoss(nn.Module):
     # KL divergence loss between Norm(mu, sigma^2) and Norm(0, I)
     # !!! consider KL annealing/scheduling !!!
@@ -297,24 +232,30 @@ class NBLoss(nn.Module):
         '''
         NB loss (negative log likelihood of NB)
         '''
+        # clamp
+        x = x.clamp(min=0)
+        mu = mu.clamp(min=self.eps)
+        theta = theta.clamp(min=self.eps)
+
         # common terms
-        log_theta_mu = torch.log(theta + mu + self.eps)
-        log_theta = torch.log(theta + self.eps)
-        log_mu = torch.log(mu + self.eps)
+        log_mu = torch.log(mu)
+        log_theta = torch.log(theta)
+        log_theta_mu = log_theta + torch.log1p(mu/theta) # =log(theta + mu), but more stable
+
 
         # NB negative log likelihood
-        log_nb = -(
-            theta * (log_theta - log_mu) +
-            x * (log_mu - log_theta_mu) +
-            torch.lgamma(x + theta + self.eps) -
-            torch.lgamma(theta + self.eps) -
-            torch.lgamma(x + 1)
+        nll = -(
+            torch.lgamma(x + theta)
+            - torch.lgamma(theta)
+            - torch.lgamma(x + 1)
+            + theta * (log_theta - log_theta_mu)
+            + x * (log_mu - log_theta_mu)
         )
 
         # reduce
-        log_nb = reduce_loss(log_nb, self.reduction)
+        nll = reduce_loss(nll, self.reduction)
 
-        return log_nb
+        return nll
     
 class UncertaintyLoss(nn.Module):
     def __init__(self, num_tasks: int):

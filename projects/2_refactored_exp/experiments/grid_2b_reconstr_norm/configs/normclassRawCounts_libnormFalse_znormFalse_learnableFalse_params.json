@@ -1,0 +1,50 @@
+{
+    "model": {
+        "dataset": "GraphDataset",
+        "out_dim": 4373,
+        "embed_dim": 128,
+        "head_dim": null,
+        "num_heads": 1,
+        "method": "node",
+        "norm_class": "RawCounts",
+        "encoder_class": "Linear",
+        "pooling_class": "AttentionSetPooling",
+        "mlp": false,
+        "variational": false,
+        "out_module": "Linear",
+        "hidden_dims": 1,
+        "act_fn": "ReLU",
+        "norm_fn": "layer",
+        "end_fn": false,
+        "norm_kwargs": {
+            "libnorm": false,
+            "znorm": false,
+            "learnable": false
+        },
+        "pooling_kwargs": null
+    },
+    "trainer": {
+        "lr": 0.001,
+        "pos_keys": null,
+        "kw_keys": {
+            "x": "x",
+            "mu": "x_pred",
+            "theta": "theta",
+            "batch_size": "batch_size",
+            "num_nodes": "num_nodes"
+        },
+        "loss_class": "NBLoss",
+        "loss_kwargs": null,
+        "optim_class": "Adam",
+        "optim_kwargs": null,
+        "early_stop": true,
+        "stop_metric": "loss",
+        "stop_kwargs": null,
+        "metric_keys": {
+            "pred": "mu",
+            "target": "x"
+        },
+        "trainer_norm_class": "LogCounts",
+        "trainer_norm_kwargs": {}
+    }
+}

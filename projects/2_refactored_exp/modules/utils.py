@@ -476,7 +476,8 @@ def get_layers(
     layer_class:nn.Module, 
     hidden_dims:list[int]=None, 
     act_fn:nn.Module=None, 
-    norm_fn:Literal['batch','layer']=None, 
+    norm_fn:Literal['batch','layer']=None,
+    dropout:float|None=None,
     end_fn:Union[bool,nn.Module]=False,
     layer_kwargs:dict={}
 ):
@@ -522,6 +523,10 @@ def get_layers(
 
         # activation function
         add_fn(layers, act_fn)
+
+        # dropout
+        if dropout is not None and dropout > 0:
+            add_fn(layers, nn.Dropout(dropout))
 
         # set next in_dim as current hidden_dim
         in_dim = hidden_dim 

@@ -59,7 +59,8 @@ class Sequential(nn.Module):
         layer_class:nn.Module, 
         hidden_dims:list[int]=None, 
         act_fn:nn.Module=None, 
-        norm_fn:Literal['batch','layer']=None, 
+        norm_fn:Literal['batch','layer']=None,
+        dropout: float | None = None,
         end_fn:Union[bool,nn.Module]=False,
         layer_kwargs:dict={},
         *args, **kwargs
@@ -73,6 +74,7 @@ class Sequential(nn.Module):
             hidden_dims,
             act_fn,
             norm_fn,
+            dropout,
             end_fn,
             layer_kwargs
         )
@@ -171,6 +173,7 @@ class AttentionSetPooling(SetPooling):
         hidden_dims:list[int]=None,
         act_fn:nn.Module=None, 
         norm_fn:Literal['batch','layer']=None, 
+        dropout: float | None = None,
         end_fn:Union[bool,nn.Module]=False,
 
         *args, **kwargs
@@ -184,13 +187,14 @@ class AttentionSetPooling(SetPooling):
             hidden_dims=hidden_dims,
             act_fn=act_fn,
             norm_fn=norm_fn,
+            dropout=dropout,
             end_fn=end_fn
         )
 
     def pool(self, x:Tensor):
         # compute masked scores, attention
         scores = self.lin(x).masked_fill(self.mask == 0, float('-inf'))
-        attn = torch.softmax(scores, dim=1) # dim 1 or -1?
+        attn = torch.softmax(scores, dim=1)
 
         # apply attention (weighted mean)
         x = torch.einsum('bnf,bns->bsf', x, attn)
@@ -210,6 +214,7 @@ class MultiheadSetPooling(SetPooling):
         hidden_dims:list[int]=None,
         act_fn:nn.Module=None, 
         norm_fn:Literal['batch','layer']=None, 
+        dropout: float | None = None,
         end_fn:Union[bool,nn.Module]=False,
         *args,
         **kwargs,
@@ -229,6 +234,7 @@ class MultiheadSetPooling(SetPooling):
             hidden_dims=hidden_dims,
             act_fn=act_fn,
             norm_fn=norm_fn,
+            dropout=dropout,
             end_fn=end_fn
         )
 
@@ -240,6 +246,7 @@ class MultiheadSetPooling(SetPooling):
                 hidden_dims=hidden_dims,
                 act_fn=act_fn,
                 norm_fn=norm_fn,
+                dropout=dropout,
                 end_fn=end_fn
             )
         else:
